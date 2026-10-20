@@ -1,0 +1,33 @@
+# yaml file to configure the standalone Landsat 8/9 aerosol QA spot check. This
+# workflow is NOT part of the {targets} pipeline - see aerosol_spot_check/README.md
+
+google_settings:
+  google_email: "therossyndicate@gmail.com" # google account associated with Earth Engine/Drive
+  ee_proj: "ee-aquamatch" # ee project name to run the pull from
+  drive_folder: "lakeSR_aerosol_spot_check" # Drive folder for GEE exports (created by GEE if absent)
+  run_date: "2026-10-19" # date of run for versioning, YYYY-MM-DD
+
+sample_settings:
+  seed: 47 # random seed for path-row and lake sampling (siteSR issue #47)
+  n_pathrows: 25 # total number of WRS2 path-rows to sample
+  max_lakes_per_pr: 50 # maximum number of lakes sampled per path-row
+  min_lakes_per_pr: 10 # path-rows with fewer lakes than this are not eligible
+  # ecoregions used for stratification (EPA/CEC Level I, North America)
+  ecoregion_url: "https://dmap-prod-oms-edc.s3.us-east-1.amazonaws.com/ORD/Ecoregions/cec_na/na_cec_eco_l1.zip"
+  # small, primarily Mexican ecoregions that only clip the US are merged into
+  # their US neighbor so they don't each take a guaranteed path-row
+  merge_ecoregions:
+    Temperate Sierras: "North American Deserts"
+    Southern Semiarid Highlands: "North American Deserts"
+    Tropical Wet Forests: "Eastern Temperate Forests"
+
+temporal_settings:
+  start_date: "2019-01-01" # spans non-smoke (2019, 2022) and notable smoke (2020, 2021, 2023) years
+  end_date: "2024-01-01" # exclusive end date
+  smoke_years: [2020, 2021, 2023] # years labeled as notable wildfire smoke years in analysis
+
+gee_settings:
+  site_buffer: 120 # buffer in meters around each lake POI, same as production
+  cloud_thresh: 90 # scene-level CLOUD_COVER filter, same as production
+  image_qual_min: 8 # minimum IMAGE_QUALITY_OLI, same as production QA
+  min_no_pix: 8 # minimum water pixel count used in production QA

@@ -1,0 +1,526 @@
+---
+title: "Landsat 8/9 aerosol QA spot check"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+params:
+  down_dir: "aerosol_spot_check/down/"
+---
+
+```{r setup, include = FALSE}
+# paths in this document are relative to the repository root, whether knitting
+# or running chunks interactively
+knitr::opts_knit$set(root.dir = rprojroot::find_root(rprojroot::is_rstudio_project))
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.width = 9, fig.height = 5)
+```
+
+```{r packages}
+library(tidyverse)
+library(yaml)
+library(knitr)
+```
+
+This standalone analysis (not part of the {targets} pipeline) informs whether
+lakeSR should mask Landsat 8/9 pixels with medium **and** high `SR_QA_AEROSOL`
+levels (the documented rule) or mask only high levels and flag medium. See
+AquaSat/AquaMatch_siteSR#47 for background.
+
+For each sampled lake and Landsat 8/9 scene, high-confidence water pixels
+(DSWE 1) were selected using the production masks (clouds, hillshadow,
+realistic values, sun glint), **without** the aerosol mask. Water pixels were
+then tallied by aerosol level (bits 6-7), and median reflectance was calculated
+for each aerosol level and under each candidate masking rule:
+
+- **nomask**: no aerosol mask (climatology, low, medium, high retained)
+- **nohigh**: mask high (climatology, low, medium retained)
+- **nomedhigh**: mask medium and high (climatology, low retained; the documented rule)
+
+```{r load}
+cfg <- read_yaml("aerosol_spot_check/config_aero_check.yml")
+min_pix <- cfg$gee_settings$min_no_pix
+smoke_years <- unlist(cfg$temporal_settings$smoke_years)
+
+sample_prs <- read_csv("aerosol_spot_check/out/sample_pathrows.csv",
+                       col_types = cols(WRS2_PR = "c"))
+
+files <- list.files(params$down_dir, pattern = "^lakeSR_aero_check_LS89_.*\\.csv$",
+                    full.names = TRUE)
+if (length(files) == 0) stop("No exports found in ", params$down_dir,
+                             ". Run 03_download_results.R first.")
+
+levels_aero <- c("clim", "low", "med", "high")
+bands <- c("Aerosol", "Blue", "Green", "Red", "Nir")
+
+dat <- map(files, \(fp) read_csv(fp, col_types = cols(id = "c", WRS2_PR = "c",
+                                                       .default = "?"))) %>%
+  bind_rows() %>%
+  mutate(across(starts_with("pCount_"), \(x) replace_na(x, 0)),
+         date = as.Date(DATE_ACQUIRED),
+         year = year(date),
+         season = case_when(month(date) %in% c(12, 1, 2) ~ "DJF",
+                            month(date) %in% 3:5 ~ "MAM",
+                            month(date) %in% 6:8 ~ "JJA",
+                            TRUE ~ "SON") %>%
+           factor(levels = c("DJF", "MAM", "JJA", "SON")),
+         smoke = if_else(year %in% smoke_years, "smoke year", "non-smoke year"),
+         satellite = str_replace(SPACECRAFT_ID, "LANDSAT_", "LS")) %>%
+  left_join(sample_prs %>% select(WRS2_PR, ecoregion), by = "WRS2_PR")
+```
+
+## Coverage
+
+`r nrow(dat)` site-scenes with at least one DSWE 1 water pixel, from
+`r n_distinct(dat$id)` lakes, `r n_distinct(dat$LANDSAT_PRODUCT_ID)` scenes and
+`r n_distinct(dat$WRS2_PR)` of `r nrow(sample_prs)` path-rows
+(`r min(dat$date)` to `r max(dat$date)`).
+
+```{r coverage}
+dat %>%
+  group_by(ecoregion) %>%
+  summarize(path_rows = n_distinct(WRS2_PR),
+            lakes = n_distinct(id),
+            scenes = n_distinct(LANDSAT_PRODUCT_ID),
+            site_scenes = n(),
+            water_pixels = sum(pCount_water)) %>%
+  arrange(desc(water_pixels)) %>%
+  kable(format.args = list(big.mark = ","))
+```
+
+## Share of water pixels by aerosol level
+
+Shares are pixel-weighted (each DSWE 1 water pixel counts once).
+
+```{r level-share}
+level_long <- dat %>%
+  select(id, LANDSAT_PRODUCT_ID, ecoregion, season, smoke, satellite, year,
+         all_of(paste0("pCount_", levels_aero))) %>%
+  pivot_longer(starts_with("pCount_"), names_to = "level", values_to = "pixels",
+               names_prefix = "pCount_") %>%
+  mutate(level = factor(level, levels = levels_aero,
+                        labels = c("climatology", "low", "medium", "high")))
+
+share_by <- function(df, ...) {
+  df %>%
+    group_by(..., level) %>%
+    summarize(pixels = sum(pixels), .groups = "drop_last") %>%
+    mutate(share = pixels / sum(pixels)) %>%
+    ungroup()
+}
+
+overall <- share_by(level_long)
+overall %>%
+  mutate(share = scales::percent(share, 0.1)) %>%
+  kable(format.args = list(big.mark = ","))
+
+plot_share <- function(df, x, title) {
+  ggplot(df, aes(x = {{ x }}, y = share, fill = level)) +
+    geom_col() +
+    scale_y_continuous(labels = scales::percent) +
+    scale_fill_viridis_d(option = "magma", begin = 0.15, end = 0.85, direction = -1) +
+    labs(x = NULL, y = "share of water pixels", fill = "aerosol level", title = title) +
+    theme_bw()
+}
+```
+
+```{r share-ecoregion, fig.height = 6}
+share_by(level_long, ecoregion) %>%
+  plot_share(ecoregion, "By ecoregion") +
+  coord_flip()
+```
+
+```{r share-season-smoke, fig.height = 7}
+share_by(level_long, ecoregion, season) %>%
+  plot_share(season, "By season and ecoregion") +
+  facet_wrap(~ ecoregion, ncol = 5)
+
+share_by(level_long, ecoregion, smoke) %>%
+  plot_share(smoke, "Smoke vs. non-smoke years, by ecoregion") +
+  facet_wrap(~ ecoregion, ncol = 5) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r share-year-sat}
+share_by(level_long, year) %>%
+  plot_share(factor(year), "By year")
+
+share_by(level_long, satellite) %>%
+  plot_share(satellite, "By satellite")
+```
+
+## Interpolated aerosol and valid retrievals over water
+
+If most water pixels carry the interpolated flag (bit 5), the aerosol level
+over lakes largely reflects retrievals from surrounding land.
+
+```{r interp}
+dat %>%
+  group_by(ecoregion) %>%
+  summarize(water_pixels = sum(pCount_water),
+            pct_interpolated = 100 * sum(pCount_interp) / water_pixels,
+            pct_valid_retrieval = 100 * sum(pCount_valid) / water_pixels) %>%
+  bind_rows(dat %>%
+              summarize(ecoregion = "All",
+                        water_pixels = sum(pCount_water),
+                        pct_interpolated = 100 * sum(pCount_interp) / water_pixels,
+                        pct_valid_retrieval = 100 * sum(pCount_valid) / water_pixels)) %>%
+  mutate(across(starts_with("pct"), \(x) round(x, 1))) %>%
+  kable(format.args = list(big.mark = ","))
+```
+
+## Site-scenes retained under each rule
+
+A site-scene is retained if at least `r min_pix` water pixels remain after
+aerosol masking (the production minimum). **as_coded** is the inverted mask
+used to create the released Landsat 8/9 data (medium and high retained).
+
+```{r retention}
+retained <- dat %>%
+  transmute(id, LANDSAT_PRODUCT_ID, ecoregion, smoke,
+            nomask = pCount_water,
+            nohigh = pCount_clim + pCount_low + pCount_med,
+            nomedhigh = pCount_clim + pCount_low,
+            as_coded = pCount_med + pCount_high) %>%
+  pivot_longer(nomask:as_coded, names_to = "rule", values_to = "pixels") %>%
+  mutate(rule = factor(rule, levels = c("nomask", "nohigh", "nomedhigh", "as_coded")),
+         kept = pixels >= min_pix)
+
+retained %>%
+  group_by(rule) %>%
+  summarize(site_scenes_kept = sum(kept),
+            pct_of_nomask = NA_real_) %>%
+  mutate(pct_of_nomask = round(100 * site_scenes_kept / site_scenes_kept[rule == "nomask"], 1)) %>%
+  kable(format.args = list(big.mark = ","))
+
+retained %>%
+  group_by(ecoregion, rule) %>%
+  summarize(kept = sum(kept), .groups = "drop_last") %>%
+  mutate(pct_of_nomask = kept / kept[rule == "nomask"]) %>%
+  ungroup() %>%
+  filter(rule != "nomask") %>%
+  ggplot(aes(x = ecoregion, y = pct_of_nomask, fill = rule)) +
+  geom_col(position = "dodge") +
+  scale_y_continuous(labels = scales::percent) +
+  coord_flip() +
+  labs(x = NULL, y = "site-scenes retained, relative to no aerosol mask",
+       title = paste0("Site-scenes with at least ", min_pix, " water pixels")) +
+  theme_bw()
+```
+
+## Low vs. medium aerosol mix within site-scenes
+
+Each site-scene's summary is a median of its water pixels, so the mix of low
+and medium pixels in a site-scene determines how much medium pixels can affect
+that median. This section looks at site-scenes retained when only high
+aerosol is masked (at least `r min_pix` climatology, low, or medium pixels).
+If most site-scenes are entirely low or entirely medium, the share of low
+pixels is a good proxy for which pixels make up the median.
+
+```{r low-med-mix}
+mix <- dat %>%
+  mutate(n_lowmed = pCount_clim + pCount_low + pCount_med,
+         p_low = (pCount_clim + pCount_low) / n_lowmed) %>%
+  filter(n_lowmed >= min_pix) %>%
+  mutate(bin = cut(p_low, c(-Inf, 0, 0.1, 0.25, 0.5, 0.75, 0.9, 1 - 1e-9, Inf),
+                   labels = c("0%\n(all medium)", "0–10%", "10–25%", "25–50%",
+                              "50–75%", "75–90%", "90–100%", "100%\n(all low)")))
+
+mix_bins <- mix %>%
+  count(bin, .drop = FALSE) %>%
+  mutate(pct = n / sum(n))
+
+ggplot(mix_bins, aes(x = bin, y = pct)) +
+  geom_col(fill = "#3b6ea8", width = 0.8) +
+  geom_text(aes(label = scales::percent(pct, 0.1)), vjust = -0.4, size = 3.2,
+            color = "grey20") +
+  scale_y_continuous(labels = scales::percent, expand = expansion(mult = c(0, 0.08))) +
+  labs(x = "share of low aerosol pixels among low + medium water pixels",
+       y = "share of site-scenes",
+       title = "Most site-scenes are entirely low or entirely medium aerosol",
+       subtitle = paste0(format(nrow(mix), big.mark = ","),
+                         " site-scenes retained when masking high aerosol only")) +
+  theme_bw() +
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor = element_blank())
+```
+
+`r scales::percent(mean(mix$p_low %in% c(0, 1)), 0.1)` of these site-scenes
+are entirely low or entirely medium, and
+`r scales::percent(mean(mix$p_low <= 0.1 | mix$p_low >= 0.9), 0.1)` have at
+most 10% or at least 90% low pixels.
+
+The table below compares the number of site-scenes kept by masking medium and
+high (the documented rule) with masking high only and letting users filter on
+the share of low pixels. Percentages are relative to site-scenes with at least
+`r min_pix` water pixels and no aerosol mask.
+
+```{r low-share-filter}
+n_nomask <- sum(dat$pCount_water >= min_pix)
+
+tibble(approach = c("mask high only",
+                    "mask high only, then filter to ≥ 50% low",
+                    "mask high only, then filter to ≥ 75% low",
+                    "mask high only, then filter to ≥ 90% low",
+                    "mask high only, then filter to 100% low",
+                    "mask medium and high (documented rule)"),
+       site_scenes = c(nrow(mix),
+                       sum(mix$p_low >= 0.5),
+                       sum(mix$p_low >= 0.75),
+                       sum(mix$p_low >= 0.9),
+                       sum(mix$p_low == 1),
+                       sum(dat$pCount_clim + dat$pCount_low >= min_pix))) %>%
+  mutate(pct_of_nomask = round(100 * site_scenes / n_nomask, 1)) %>%
+  kable(format.args = list(big.mark = ","))
+```
+
+## Reflectance by aerosol level
+
+### Within site-scene
+
+Where a single site-scene has at least `r min_pix` pixels at a given aerosol
+level **and** at least `r min_pix` climatology/low pixels, the median
+reflectance at that level is compared to the climatology/low median from the
+same scene and lake. Mixed-level site-scenes may be uncommon because aerosol
+level varies smoothly in space.
+
+```{r within-scene}
+refl_long <- dat %>%
+  select(id, LANDSAT_PRODUCT_ID, ecoregion, smoke, season,
+         pCount_clim, pCount_low, pCount_med, pCount_high,
+         matches(paste0("^med_(", paste(bands, collapse = "|"), ")_"))) %>%
+  pivot_longer(starts_with("med_"), names_to = c("band", "group"),
+               names_pattern = "med_(.*)_(.*)", values_to = "refl")
+
+ref_lowclim <- refl_long %>%
+  filter(group == "nomedhigh", pCount_clim + pCount_low >= min_pix) %>%
+  select(id, LANDSAT_PRODUCT_ID, band, ref = refl)
+
+within <- refl_long %>%
+  filter((group == "med" & pCount_med >= min_pix) |
+           (group == "high" & pCount_high >= min_pix)) %>%
+  inner_join(ref_lowclim, by = c("id", "LANDSAT_PRODUCT_ID", "band")) %>%
+  filter(!is.na(refl), !is.na(ref)) %>%
+  mutate(diff = refl - ref,
+         pct_diff = 100 * diff / ref,
+         band = factor(band, levels = bands),
+         group = factor(group, levels = c("med", "high"),
+                        labels = c("medium", "high")))
+
+within %>%
+  group_by(group, band) %>%
+  summarize(n_site_scenes = n(),
+            median_diff = median(diff),
+            median_pct_diff = median(pct_diff),
+            q25_pct_diff = quantile(pct_diff, 0.25),
+            q75_pct_diff = quantile(pct_diff, 0.75),
+            .groups = "drop") %>%
+  mutate(across(where(is.double), \(x) signif(x, 3))) %>%
+  kable()
+```
+
+```{r within-scene-plot}
+# axis limits that show every box and whisker in full (plus zero); outliers
+# beyond the whiskers can fall outside, and are counted in the caption
+whisker_limits <- function(df, ...) {
+  ext <- df %>%
+    group_by(...) %>%
+    summarize(lo = boxplot.stats(diff)$stats[1],
+              hi = boxplot.stats(diff)$stats[5],
+              .groups = "drop")
+  lims <- range(c(ext$lo, ext$hi, 0))
+  lims + c(-1, 1) * 0.05 * diff(lims)
+}
+
+outlier_caption <- function(df, lims) {
+  n_out <- sum(df$diff < lims[1] | df$diff > lims[2])
+  paste0(n_out, " of ", format(nrow(df), big.mark = ","),
+         " values (all outliers beyond the whiskers) lie outside the plotted range")
+}
+
+if (nrow(within) > 0) {
+  lims <- whisker_limits(within, group, band)
+  ggplot(within, aes(x = band, y = diff, fill = group)) +
+    geom_hline(yintercept = 0, linetype = 2) +
+    geom_boxplot(outlier.size = 0.4) +
+    coord_cartesian(ylim = lims) +
+    labs(x = NULL, y = "median reflectance minus climatology/low median (same scene)",
+         fill = "aerosol level", caption = outlier_caption(within, lims)) +
+    theme_bw()
+}
+```
+
+### Within lake, across scenes
+
+Each site-scene is assigned its dominant aerosol level (the level with the
+most water pixels). For each lake, the median reflectance across scenes
+dominated by medium or high aerosol is compared to the lake's median across
+scenes dominated by climatology/low aerosol. Seasonal and smoke-year
+differences in water quality can contribute to these differences, so they
+complement the within-scene comparison rather than replace it.
+
+```{r within-lake}
+dominant <- dat %>%
+  filter(pCount_water >= min_pix) %>%
+  mutate(dominant = case_when(
+    pCount_clim + pCount_low >= pmax(pCount_med, pCount_high) ~ "clim/low",
+    pCount_med >= pCount_high ~ "medium",
+    TRUE ~ "high")) %>%
+  select(id, LANDSAT_PRODUCT_ID, ecoregion, dominant,
+         all_of(paste0("med_", bands, "_nomask"))) %>%
+  pivot_longer(starts_with("med_"), names_to = "band", values_to = "refl",
+               names_pattern = "med_(.*)_nomask")
+
+within_lake <- dominant %>%
+  group_by(id, ecoregion, band, dominant) %>%
+  summarize(refl = median(refl, na.rm = TRUE), n_scenes = n(), .groups = "drop") %>%
+  pivot_wider(id_cols = c(id, ecoregion, band), names_from = dominant,
+              values_from = refl) %>%
+  pivot_longer(any_of(c("medium", "high")), names_to = "group", values_to = "refl") %>%
+  filter(!is.na(refl), !is.na(`clim/low`)) %>%
+  mutate(diff = refl - `clim/low`,
+         pct_diff = 100 * diff / `clim/low`,
+         band = factor(band, levels = bands),
+         group = factor(group, levels = c("medium", "high")))
+
+within_lake %>%
+  group_by(group, band) %>%
+  summarize(n_lakes = n(),
+            median_diff = median(diff),
+            median_pct_diff = median(pct_diff),
+            q25_pct_diff = quantile(pct_diff, 0.25),
+            q75_pct_diff = quantile(pct_diff, 0.75),
+            .groups = "drop") %>%
+  mutate(across(where(is.double), \(x) signif(x, 3))) %>%
+  kable()
+```
+
+```{r within-lake-ecoregion, fig.height = 6}
+if (nrow(within_lake) > 0) {
+  within_lake_blue <- within_lake %>% filter(band == "Blue")
+  lims <- whisker_limits(within_lake_blue, group, ecoregion)
+  ggplot(within_lake_blue, aes(x = ecoregion, y = diff, fill = group)) +
+    geom_hline(yintercept = 0, linetype = 2) +
+    geom_boxplot(outlier.size = 0.4) +
+    coord_flip(ylim = lims) +
+    labs(x = NULL, y = "lake median Blue minus clim/low-dominated median",
+         fill = "dominant level", caption = outlier_caption(within_lake_blue, lims)) +
+    theme_bw()
+}
+```
+
+## Effect of the masking rule on reported reflectance
+
+For site-scenes retained under both rules, the difference between the
+site-scene median reflectance reported under **nomask** or **nohigh** and
+under **nomedhigh** (the documented rule). This shows how much the choice of
+rule would change the values in lakeSR, separately from how many observations
+it removes.
+
+```{r rule-effect}
+rule_pix <- retained %>%
+  select(id, LANDSAT_PRODUCT_ID, rule, pixels) %>%
+  pivot_wider(names_from = rule, values_from = pixels, names_prefix = "pix_")
+
+rule_effect <- refl_long %>%
+  filter(group %in% c("nomask", "nohigh", "nomedhigh")) %>%
+  select(id, LANDSAT_PRODUCT_ID, ecoregion, band, group, refl) %>%
+  pivot_wider(names_from = group, values_from = refl) %>%
+  left_join(rule_pix, by = c("id", "LANDSAT_PRODUCT_ID")) %>%
+  filter(pix_nomedhigh >= min_pix) %>%
+  transmute(id, LANDSAT_PRODUCT_ID, ecoregion,
+            band = factor(band, levels = bands),
+            nomask = nomask - nomedhigh,
+            nohigh = nohigh - nomedhigh) %>%
+  pivot_longer(c(nomask, nohigh), names_to = "rule", values_to = "diff")
+
+rule_effect %>%
+  group_by(rule, band) %>%
+  summarize(n_site_scenes = n(),
+            n_changed = sum(abs(diff) > 0, na.rm = TRUE),
+            median_diff = median(diff, na.rm = TRUE),
+            mean_abs_diff = mean(abs(diff), na.rm = TRUE),
+            p95_abs_diff = quantile(abs(diff), 0.95, na.rm = TRUE),
+            .groups = "drop") %>%
+  mutate(across(where(is.double), \(x) signif(x, 3))) %>%
+  kable(format.args = list(big.mark = ","))
+```
+
+## Takeaways
+
+_Written from the 2026-10-19 run (25 path-rows, 2019–2023). Some numbers below
+(ecoregion, season and dominant-level breakdowns) were calculated from the same
+exports but are not printed as tables above. Update this section if the sample
+or the pull changes._
+
+**Masking high aerosol is clearly justified. Masking medium as well (the
+documented rule) is defensible, but costs a substantial share of observations.**
+
+1. **Medium and high aerosol cover about 43% of DSWE 1 water pixels, not the
+   ~85% reported in siteSR#47.** Overall, 57% of water pixels are low, 26%
+   medium and 17% high; none are climatology. The share varies by region, from
+   30% medium/high in Mediterranean California to 71% in the Marine West Coast
+   Forest (coastal southeast Alaska). It also varies by season: about 48% in
+   spring and summer and 36% in fall and winter. Smoke years differ only
+   slightly from other years (44% vs. 41%), and Landsat 8 and 9 are similar.
+   The 85% figure likely reflects where the reporter's siteSR matchups are.
+
+2. **The aerosol level over lakes is almost entirely interpolated from land.**
+   About 89% of water pixels carry the interpolated-aerosol flag (bit 5) in
+   every ecoregion, and only 1.6% have a valid aerosol retrieval. The aerosol
+   QA level for a lake therefore mostly reflects conditions over the
+   surrounding land.
+
+3. **Medium-aerosol pixels are consistently darker than low-aerosol pixels in
+   the same lake and scene.** In 1,124 site-scenes with at least 8 pixels at
+   both levels, the median Blue reflectance of medium pixels is lower by about
+   0.004. That is roughly 20% of typical Blue water reflectance (about 0.018).
+   The difference is negative in 93–100% of site-scenes in every ecoregion, and
+   Green, Red and Nir are also lower (by about 7–10%). This is consistent with
+   over-correction of path radiance over dark water when the atmospheric
+   correction assumes a higher aerosol load. Pixels with different levels may
+   sit in different parts of a lake, so location is not fully ruled out, but
+   the consistency across regions suggests a real bias.
+
+4. **Scenes dominated by high aerosol appear contaminated.** Compared with
+   scenes dominated by low aerosol, they are brighter (median Blue 0.024 vs.
+   0.018, Nir 0.027 vs. 0.016) and cloudier (median scene cloud cover 21% vs.
+   7%). This is consistent with residual haze or thin cloud and supports the
+   USGS guidance against using high-aerosol pixels. Only 17 site-scenes had
+   enough high and low pixels for a same-scene comparison, so this relies on
+   the comparison across scenes.
+
+5. **The choice of rule mainly decides which observations exist, not their
+   values.** Relative to no aerosol mask, masking high only keeps 84% of
+   site-scenes with at least 8 water pixels, and masking medium and high keeps
+   60%. The inverted mask used for the released Landsat 8/9 data keeps only
+   44%, and those are exactly the medium/high-aerosol pixels shown above to be
+   darker (medium) or contaminated (high). Most site-scenes (69%) have a
+   single aerosol level, so for site-scenes retained under both rules, adding
+   medium pixels barely changes the median (95th percentile difference: 0.002
+   in Blue).
+
+6. **Most site-scenes are entirely low or entirely medium aerosol.** Among
+   site-scenes retained when only high aerosol is masked, 74% contain only one
+   of the two levels (54% all low, 21% all medium), and 83% are at least 90%
+   one level. Most of the extra site-scenes gained by keeping medium pixels
+   are therefore made up entirely of medium-aerosol pixels.
+
+**Decision:** we are fixing the inverted mask and keeping the documented rule
+of masking medium **and** high aerosol pixels, accepting the apparent "loss" of
+site-scenes relative to masking high only (60% vs. 84%) in order to retain
+high-quality data. That loss is only apparent. The alternative of masking high
+only and passing the choice to users through a percent-low-aerosol flag would
+leave quality-minded users with *fewer* observations: filtering to at least
+50% low pixels keeps 59% of site-scenes, at least 90% keeps 50%, and 100%
+keeps 45%. Masking medium and high retains 60%, more than any of those
+filters, because each site-scene's median is calculated from its low-aerosol
+pixels alone rather than discarding any site-scene that contains medium
+pixels. It also avoids the consistent dark bias of medium-aerosol pixels
+(point 3) and matches the documentation that passed USGS review.
+
+**Caveats:** this is a sample of 25 path-rows over 2019–2023. The same-scene
+comparison is limited to mixed-level site-scenes, which may be transition
+zones. The size of the medium-aerosol bias has not yet been compared with the
+between-mission differences that the intermission handoffs correct for.
