@@ -1,169 +1,102 @@
-#' @title Calcuate POI center for NHD Best Resolution waterbodies from The 
-#' National Map for States that had no waterbodies in the HUC4s via NHDPlus v2
-#' 
+#' @title Calculate POI centers for NHD Best Resolution waterbodies by HUC4
+#'
 #' @description
-#' using the downloaded NHD file subset to lakes/res/impoundments, subset to >= 1ha, and 
-#' calculate POI for each polygon. POI will calculate distance in meters using 
-#' the UTM coordinate system and the POI as Latitude/Longitude in WGS84 decimal 
-#' degrees.
-#' 
-#' @returns silently saves .csv file in mid folder of the POI centers and 
-#' associated WBD metadata
-#' 
-#' 
-calculate_bestres_centers <- function(HUC4) {
-  
-  # set timeout so that... this doesn't timeout
+#' Download the NHD Best Resolution HU4 GeoPackage from The National Map, subset
+#' the waterbodies to lakes/reservoirs >= 1ha (excluding small intermittent
+#' lakes/ponds), and calculate the POI for each polygon. POI distance to shore
+#' is calculated in meters using the UTM coordinate system and the POI is
+#' returned as Latitude/Longitude in WGS84 decimal degrees.
+#'
+#' @param HUC4_manifest one-row tibble from `get_bestres_manifest()` with huc4,
+#' url, and etag columns
+#' @param dl_dir directory to temporarily store downloaded files
+#'
+#' @returns tibble of POI centers and associated waterbody metadata, or NULL if
+#' no waterbodies in the HUC4 meet the criteria
+#'
+#'
+calculate_bestres_centers <- function(HUC4_manifest,
+                                      dl_dir = "a_Calculate_Centers/nhd/") {
+
+  HUC4 <- HUC4_manifest$huc4
+  message(paste0("Beginning center calculation for HUC4 ", HUC4))
+
+  # make sure the file on The National Map is the same version recorded in the
+  # manifest
+  header <- curl_fetch_memory(HUC4_manifest$url,
+                              handle = new_handle(nobody = TRUE))
+  current_etag <- str_remove_all(parse_headers_list(header$headers)$etag, '"')
+  if (!identical(current_etag, HUC4_manifest$etag)) {
+    stop(paste0("The NHD GeoPackage for HUC4 ", HUC4, " has changed since the ",
+                "manifest was created. Run `tar_invalidate(a_HUC4_manifest)` to ",
+                "use the updated files (this is a new centers version)."))
+  }
+
+  # download and unzip in a HUC4-specific folder, removed upon exit
+  huc_dir <- file.path(dl_dir, HUC4)
+  dir.create(huc_dir, showWarnings = FALSE)
+  on.exit(unlink(huc_dir, recursive = TRUE))
+
   options(timeout = 60000)
-  
-  # url for the NHD Best Resolution for HUC4
-  url = paste0("https://prd-tnm.s3.amazonaws.com/StagedProducts/Hydrography/NHD/HU4/GPKG/NHD_H_", HUC4, "_HU4_GPKG.zip")
-  download.file(url, destfile = file.path("a_Calculate_Centers/nhd/", 
-                                          paste0(HUC4, ".zip")))
-  unzip(file.path("a_Calculate_Centers/nhd/", 
-                  paste0(HUC4, ".zip")), 
-        exdir = "a_Calculate_Centers/nhd/")
-  # remove zip
-  unlink(file.path("a_Calculate_Centers/nhd/", 
-                   paste0(HUC4, ".zip")))
-  
-  # open the NHDWaterbody layer, coerce to a {sf} object
-  wbd <- st_read(file.path("a_Calculate_Centers/nhd/",
-                           paste0("NHD_H_", HUC4, "_HU4_GPKG.gpkg")),
-                 layer = "NHDWaterbody")
-  
-  wbd <- wbd %>% 
-    filter(
-      # filter the waterbodies for ftypes of interest. 390 = lake/pond; 436 = res
-      ftype %in% c(390, 436),
-      # ...and for area > 1 hectare (0.01 km^2)
-      areasqkm >= 0.01) 
-  
-  # subset smaller (<4ha) lakes/ponds that are characterized as intermittent
-  intermittent <- wbd %>% 
-    filter(
-      areasqkm < 0.04,
-      fcode %in% c(39001, 39005, 39006, 43614)
-    )
-  # remove intermittent from wbd for processing ease
-  wbd_filter <- wbd %>% filter(!permanent_identifier %in% intermittent$permanent_identifier)
-  
-  # check for valid polygons
-  wbd_filter <- wbd_filter %>% 
-    st_make_valid()
-  
-  # pull out geometries that are still invalid, if any
-  invalid <- wbd_filter[!st_is_valid(wbd_filter), ]
-  # if there are any, simplify (st_simplify usually fails here, so using 
-  # rmapshaper::ms_simplify())
-  if (nrow(invalid) > 0) {
-    sf_use_s2(TRUE) # make sure that we're using spherical geometry here
-    wbd_less <- wbd_filter[!wbd_filter$comid %in% invalid$comid, ]
-    fixed <- invalid %>% 
-      ms_simplify(keep = 0.75)
-    wbd_filter <- bind_rows(wbd_less, fixed)
+  zip_file <- file.path(huc_dir, basename(HUC4_manifest$url))
+  download.file(HUC4_manifest$url, destfile = zip_file, quiet = TRUE)
+  gpkg_name <- paste0("NHD_H_", HUC4, "_HU4_GPKG.gpkg")
+  unzip(zip_file, files = gpkg_name, exdir = huc_dir)
+
+  # read the NHDWaterbody layer, filtering for:
+  #   ftypes of interest: 390 = lake/pond; 436 = reservoir
+  #   area >= 1 hectare (0.01 km^2)
+  #   and removing small (< 4 ha) lakes/ponds that are characterized as
+  #   intermittent
+  wbd <- st_read(file.path(huc_dir, gpkg_name),
+                 query = "SELECT * FROM NHDWaterbody
+                          WHERE ftype IN (390, 436)
+                            AND areasqkm >= 0.01
+                            AND NOT (areasqkm < 0.04 AND
+                                     fcode IN (39001, 39005, 39006, 43614))",
+                 quiet = TRUE)
+
+  if (nrow(wbd) == 0) {
+    message(paste0("HUC4 ", HUC4, " contains no waterbodies that meet criteria."))
+    return(NULL)
   }
-  
-  # check for valid geometry and drop z coords (if they exist)
-  wbd_valid <- wbd_filter %>% 
-    rowwise() %>% 
-    # drop z coordinate for processing ease
-    st_zm(drop = T) %>% 
-    # union the geos by feature
-    st_union(by_feature = TRUE) %>% 
-    # add a rowid for future steps
-    rowid_to_column("lakeSR_id") %>% 
-    ungroup()
-  
-  wbd_info <- wbd_valid %>% 
-    st_drop_geometry() %>% 
-    select(permanent_identifier, gnis_id, gnis_name, areasqkm, reachcode, ftype, fcode)
-  
-  # for each polygon, calculate a center. Because sf doesn't map easily, using a 
-  # loop. Each loop adds a row the the poi_df dataframe.
-  poi_df <- tibble(
-    lakeSR_id = numeric(),
-    permanent_identifier = character(),
-    poi_Longitude = numeric(),
-    poi_Latitude = numeric(),
-    poi_dist_m = numeric()
-  )
-  if(nrow(wbd_valid) > 0) {
-    for (i in 1:length(wbd_valid[[1]])) {
-      poi_df  <- poi_df %>% add_row()
-      one_wbd <- wbd_valid[i, ]
-      # transform crs, NHD is already in EPSG:4326, but just in case there is an outlier
-      one_wbd <- st_transform(one_wbd, crs = "EPSG:4326")
-      # get coordinates to calculate UTM zone. This is an adaptation of code from
-      # Xiao Yang's code in EE - Yang, Xiao. (2020). Deepest point calculation 
-      # for any given polygon using Google Earth Engine JavaScript API 
-      # (Version v1). Zenodo. https://doi.org/10.5281/zenodo.4136755
-      coord_for_UTM <- one_wbd %>% st_coordinates()
-      mean_x <- mean(coord_for_UTM[, 1])
-      mean_y <- mean(coord_for_UTM[, 2])
-      # calculate the UTM zone using the mean value of Longitude for the polygon
-      utm_suffix <- as.character(ceiling((mean_x + 180) / 6))
-      utm_code <- if_else(mean_y >= 0,
-                          # EPSG prefix for N hemisphere
-                          paste0('EPSG:326', utm_suffix),
-                          # for S hemisphere
-                          paste0('EPSG:327', utm_suffix))
-      # transform wbd to UTM
-      one_wbd_utm <- st_transform(one_wbd, 
-                                  crs = utm_code)
-      # get UTM coordinates
-      coord <- one_wbd_utm %>% st_coordinates()
-      x <- coord[, 1]
-      y <- coord[, 2]
-      # using coordinates, get the poi distance
-      poly_poi <- poi(x, y, precision = 0.01)
-      # add info to poi_df
-      poi_df$lakeSR_id[i] = wbd_valid[i, ]$lakeSR_id
-      poi_df$permanent_identifier[i] = as.character(wbd_valid[i, ]$permanent_identifier)
-      poi_df$poi_dist_m[i] = poly_poi$dist
-      # make a point feature and re-calculate decimal degrees in WGS84
-      point <- st_point(x = c(as.numeric(poly_poi$x),
-                              as.numeric(poly_poi$y)))
-      point <- st_sfc(point, crs = utm_code)
-      point <- st_transform(st_sfc(point), crs = 'EPSG:4326')
-      
-      new_coords <- point %>% st_coordinates()
-      poi_df$poi_Longitude[i] = new_coords[, 1]
-      poi_df$poi_Latitude[i] = new_coords[, 2]
-    }
-    
-    # we still need to dummy check to be sure that all of the poi centers are
-    # inside the original polygons... sometimes when things are simplified too much
-    # the point ends up being outside of the polygon area.
-    poi_sf <- st_as_sf(poi_df, 
-                       coords = c("poi_Longitude", "poi_Latitude"), 
-                       crs = "EPSG:4326")
-    # transform the points to the same crs as the waterbodies
-    poi_sf_trans <- st_transform(poi_sf, st_crs(wbd_valid))
-    # filter for containment
-    contained_poi <- poi_sf_trans[wbd_valid, ]
-    
-    # and now grab the poi lat/lon from the poi_df and drop geometry
-    poi <- contained_poi %>%
-      left_join(., poi_df) %>% 
-      st_drop_geometry() %>% 
-      left_join(., wbd_info)
-    
-    # clean up workspace for quicker processing
-    # remove the fp and all contents completely before next HUC4
-    unlink(file.path("a_Calculate_Centers/nhd/", paste0("NHD_H_", HUC4, "_HU4_GPKG.gpkg")))
-    unlink(file.path("a_Calculate_Centers/nhd/", paste0("NHD_H_", HUC4, "_HU4_GPKG.xml")))
-    unlink(file.path("a_Calculate_Centers/nhd/", paste0("NHD_H_", HUC4, "_HU4_GPKG.jpg")))
-    
-    # return the dataframe with location info
-    return(poi %>% 
-             mutate(lakeSR_id = paste(HUC4, lakeSR_id, sep = "_")) %>% 
-             relocate(lakeSR_id, permanent_identifier, poi_Latitude, poi_Longitude, poi_dist_m))
-  } else { # if there are no waterbodies that meet criteria, return null
-    
-    NULL
-    
+
+  # drop z coordinates and transform to WGS84 (NHD is in NAD83)
+  wbd <- wbd %>%
+    st_zm(drop = TRUE) %>%
+    st_transform(crs = "EPSG:4326")
+
+  # assign each polygon a UTM zone using the center of its bounding box
+  bbox_center <- map(st_geometry(wbd), \(g) {
+    bb <- st_bbox(g)
+    c(x = mean(bb[c("xmin", "xmax")]), y = mean(bb[c("ymin", "ymax")]))
+  }) %>%
+    do.call(rbind, .)
+  utm_zone <- floor((bbox_center[, "x"] + 180) / 6) + 1
+  wbd$utm_epsg <- if_else(bbox_center[, "y"] >= 0,
+                          32600 + utm_zone, # EPSG prefix for N hemisphere
+                          32700 + utm_zone) # for S hemisphere
+
+  # calculate POI for all polygons within each UTM zone
+  poi <- split(wbd, wbd$utm_epsg) %>%
+    map(\(zone_wbd) calculate_poi(zone_wbd, utm_epsg = unique(zone_wbd$utm_epsg))) %>%
+    list_rbind()
+
+  # polygons that are empty after validation have no location; note and remove
+  no_location <- poi %>% filter(is.na(poi_Latitude) | is.na(poi_Longitude))
+  if (nrow(no_location) > 0) {
+    warning(paste0(nrow(no_location), " waterbodies in HUC4 ", HUC4,
+                   " have no valid geometry and were dropped: ",
+                   paste(no_location$permanent_identifier, collapse = ", ")))
   }
-  
-  
+
+  wbd %>%
+    st_drop_geometry() %>%
+    select(permanent_identifier, gnis_id, gnis_name, areasqkm, reachcode, ftype, fcode) %>%
+    inner_join(poi %>% filter(!is.na(poi_Latitude), !is.na(poi_Longitude)),
+               by = "permanent_identifier") %>%
+    mutate(huc4 = HUC4,
+           across(c(permanent_identifier, gnis_id, gnis_name, reachcode), as.character)) %>%
+    relocate(huc4, permanent_identifier, poi_Latitude, poi_Longitude, poi_dist_m, poi_method)
+
 }

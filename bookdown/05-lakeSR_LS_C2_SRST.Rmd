@@ -10,8 +10,8 @@ bibliography: references.bib
 The lakeSR data product is a set of tabular datasets, representing the Landsat
 surface reflectance and surface temperarture data summarized for the point of
 inaccessibility location which is meant to represent conditions at a given
-waterbody at a location far from shore (identified by its NHD unique identifier,
-see Section \@ref(locs-data-acq)). This data product contains "full stacks" of
+waterbody at a location far from shore (identified by its `lakeSR_id`, see
+Section \@ref(locs-data-acq)). This data product contains "full stacks" of
 the Landsat Collection 2 record - that is, all summarized Landsat data available
 within GEE (through 2024-12-31) from all Landsat missions that met our
 within-image QA criteria.
@@ -65,7 +65,7 @@ this example, location 1 would be extracted for both path-row 1 and 2, location
     extents. The code below is an example of this type of filtering that occurs
     per mission as we run a path-row extraction, where we once clipped the stack
     to the AOI of the path-row instead of filtering for the path-row itself.
-    Example below is from code at line 1850 in the file
+    Example below is from code at line 863 in the file
     `b_pull_Landsat_SRST_poi/py/run_GEE_per_pathrow.py` within the lakeSR
     repository.
 
@@ -139,6 +139,16 @@ this example, location 1 would be extracted for both path-row 1 and 2, location
     rows from the summarized GEE product containing no data before export. This
     adds efficiency to the pull by removing those rows before export, which is a
     source of added time in the GEE bottleneck.
+
+-   summarizing all DSWE variants (DSWE1, DSWE1a, and/or DSWE3, see Section
+    \@ref(dswe-implementation)) in a single GEE task. The variants share all of
+    the per-image processing (masks, hillshade, hillshadow, DSWE) and differ
+    only in the water area that is summarized, so the processing is done once
+    per image and each variant is summarized in the same `reduceRegions` call
+    (function `ref_pull_combined`). In testing, this used about two thirds of
+    the GEE compute of sending one task per variant. The exported file has the
+    variant name as a column prefix (e.g. `DSWE1a__med_Blue`) and is split into
+    one file per variant after download (see Section \@ref(payload-handling)).
 
 -   checking for failed tasks in GEE. For AquaMatch, a failed task would
     indicate that a path-row acquisition had an error and was not completed
@@ -308,8 +318,8 @@ on-the-fly calculation made within our workflow are as follows:
 2.  we mask any DSWE values that are not fully illuminated (a value of 0 in the
     function below) as defined by the `ee.Terrain.hillShadow` function in Google
     Earth Engine using the Multi-Error-Removed Improved-Terrain Digital
-    Elevation Model (MERIT DEM) version 1.0.3 [@yamazaki2017] at an extent of
-    3000 meters surrounding a given point for analysis.
+    Elevation Model (MERIT DEM) version 1.0.3 [@yamazaki2017], clipped to the
+    WRS-2 path-row buffered by 3000 meters.
 
     ```{python}
     #| eval: false
@@ -317,23 +327,38 @@ on-the-fly calculation made within our workflow are as follows:
 
     def calc_hill_shadows(image, geo):
       """ caluclate the hill shadow per pixel
-      
+
       Args:
           image: ee.Image of an ee.ImageCollection
           geo: geometry of the WRS tile as wrs.geometry() in script
-      
+
       Returns:
-          a band named 'hillShadow' where values calculated are the hill shadow per 
+          a band named 'hillShadow' where values calculated are the hill shadow per
           pixel. output 1 where pixels are illumunated and 0 where they are shadowed.
       """
       MergedDEM = ee.Image("MERIT/DEM/v1_0_3").clip(geo.buffer(3000))
-      hillShadow = ee.Terrain.hillShadow(MergedDEM, 
+      hillShadow = ee.Terrain.hillShadow(MergedDEM,
         ee.Number(image.get('SUN_AZIMUTH')),
-        ee.Number(90).subtract(image.get('SUN_ELEVATION')), 
-        30)
+        ee.Number(90).subtract(image.get('SUN_ELEVATION')),
+        100)
       hillShadow = hillShadow.rename(['hillShadow'])
       return hillShadow
     ```
+
+    The final argument of `ee.Terrain.hillShadow` is the neighborhood size in
+    pixels, which limits how far toward the sun the function looks for terrain
+    that casts a shadow. At the 30 meter scale of our summaries, 100 pixels is
+    about 3 kilometers. Terrain casts a shadow about 1/tan(sun elevation) times
+    its height above the pixel, so at low sun elevations (e.g., about 2.2 times
+    its height at 24°) shadows from tall terrain can be several kilometers
+    long. With a shorter neighborhood (30 pixels, used in previous versions of
+    this workflow), these shadows were not reliably detected, and whether they
+    were depended on how GEE divided the computation among sites. In tests
+    across scenes with sun elevations of 16-62° in southeast Alaska and
+    Colorado, a neighborhood of 100 pixels was as accurate as 200-450 pixels,
+    while 30 pixels misclassified up to a third of sites at low sun. Some
+    sensitivity to how GEE divides the computation remains at any neighborhood
+    size (up to about 0.15 in `prop_hillShadow` for a few sites per scene).
 
     This is different from the implementation described in the Level 3 data
     product which uses a set of hillshade and landcover thresholds to determine
@@ -446,7 +471,7 @@ alongside the remote sensing summaries in the lakeSR and siteSR output files
 `lakeSR_Landsat9_DSWE1_2025-06-04.feather`,
 `siteSR_Landsat4_DSWE1_2025-06-06.feather`).
 
-## Payload handling
+## Payload handling {#payload-handling}
 
 Because GEE is a free service to those at academic or governmental institutions,
 there are limits to the total number of tasks being run co-currently on GEE's
@@ -454,9 +479,28 @@ platform. For this reason, tasks are sent to GEE as path-row groups as soon as
 there are fewer than 10 tasks in the GEE tasks queue. Additionally, any path-row
 containing more than 5,000 POI locations are sent as separate tasks in 5000
 location chunks. This is an additional step that is taken in addition to
-processing per path-row to avoid failed tasks. This management is orchestrated
-within the `run_GEE_per_pathrow.py` script and through integration with
-{targets} which runs this script per WRS-2 pathrow.
+processing per path-row to avoid failed tasks. Before chunking, locations are
+ordered along a Hilbert curve (function `sort_spatially`), which keeps
+locations that are close together in space close together in the ordering, so
+that each chunk covers a compact area and fewer image tiles are processed for
+more than one chunk. This management is orchestrated within the
+`run_GEE_per_pathrow.py` script and through integration with {targets} which
+runs this script per WRS-2 pathrow.
+
+Each path-row chunk is sent as one task per Landsat mission group (Landsat 4-7
+and Landsat 8-9) that summarizes all DSWE variants in the configuration. After
+the exported files are downloaded from Google Drive, each file (e.g.
+`LSC2_poi_site_LS89_C2_SRST_DSWEcombo1-1a_029027_0_vRUN_DATE.csv`) is split
+into one file per DSWE variant (e.g.
+`LSC2_poi_site_LS89_C2_SRST_DSWE1_029027_0_vRUN_DATE.csv`) by the target
+`c_split_combined_files`, and the per-variant files are then collated.
+
+The GEE pull uses a large amount of Earth Engine compute (EECU), and Google
+Cloud projects have compute quotas. The Google Cloud project used for the GEE
+tasks is set by `ee_proj` in the GEE configuration file, and can be overridden
+by setting the `LAKESR_EE_PROJ` environment variable before running the
+pipeline (see `run_targets.Rmd`), for example to continue a run from a
+different project.
 
 We have also implemented a status check for tasks sent to GEE to determine if
 any have failed (Python script `check_for_failed_tasks.py`), as once the tasks

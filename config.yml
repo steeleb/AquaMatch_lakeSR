@@ -49,11 +49,11 @@ admin_update:
   # files using the google_email account listed
   google_email: "therossyndicate@gmail.com" 
   calculate_centers: TRUE
-  centers_version: "2025-02-12" # update upon initial run, or if changes in -a-
+  centers_version: "2026-10-20" # update upon initial run, or if changes in -a-
   # group. if unchanged, updated files will be overwritten.
   run_GEE: TRUE 
-  parent_Drive_folder: "~/lakeSR_Landsat_C2/"
+  parent_Drive_folder: "~/lakeSR_Landsat_C2_2026/"
   update_and_share: TRUE 
-  qa_version: "2025-06-04"
+  qa_version: "2026-10-20"
   update_bookdown: TRUE 
   siteSR_repo_directory: "../AquaMatch_siteSR_WQP/" 

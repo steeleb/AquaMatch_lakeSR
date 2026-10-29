@@ -18,9 +18,9 @@ knitr::opts_chunk$set(echo = FALSE,
 ```
 
 ```{r r-setup-data-acq, echo = FALSE}
-CONUS <- a_poi_with_flags %>% 
-  filter(nhd_source == "NHDBestRes")
-nonCONUS <- anti_join(a_poi_with_flags, CONUS)
+# waterbodies outside of the conterminous US are in HUC2s 19-22
+nonCONUS <- a_poi_with_flags %>%
+  filter(as.numeric(str_sub(lakeSR_id, 1, 2)) >= 19)
 ```
 
 # Locations of Data Acquisition {#locs-data-acq}
@@ -29,7 +29,7 @@ nonCONUS <- anti_join(a_poi_with_flags, CONUS)
 
 This process is completed in the targets group `a_calculate_centers`. The
 primary output file is the lakeSR site file
-(`lakeSR_poi_with_flags_2025-02-12.csv`).
+(`lakeSR_poi_with_flags_2026-10-20.csv`).
 
 **Background**
 
@@ -62,22 +62,26 @@ remote sensing data.
 
 ## Waterbodies Included in lakeSR {#waterbodies}
 
-For lakeSR, we use the NHDPlusV2 dataset for lakes within the conterminous US
-using the {nhdplusTools} R package [@blodgett2023] and the NHD Best Resolution
-[e.g. @usgeologicalsurvey] data through The National Map for lakes outside of
-the extent of the conterminous US. Two versions are used because NHDPlusV2
-waterbodies are not available outside of CONUS (oCONUS). The NHD Best Resolution
-data are of slightly higher resolution relative to NHDPlusV2 and are complete
-and available for all states and territories oCONUS. All waterbody polygons were
-downloaded and processed on `r params$locs_run_date` by HUC4 using the most
-updated version available at the time of download.
+For lakeSR, we use the USGS National Hydrography Dataset (NHD) Best Resolution
+product [@usgeologicalsurvey] for all waterbodies in the United States and
+territories. The NHD Best Resolution data are distributed by HUC4 as
+GeoPackages through The National Map and provide complete coverage of the
+conterminous US (CONUS), Alaska, Hawaii, the Caribbean, and the Pacific
+territories from a single, consistent source. All HU4 GeoPackages available on
+The National Map are included in lakeSR. The list of HU4 GeoPackages, along
+with each file's last-modified date and ETag (a unique identifier of the file
+version), is recorded in a manifest file
+(`lakeSR_NHD_manifest_[centers_version].csv`) so that the exact source data used
+for each version of the lakeSR locations are documented. Each file is checked
+against the manifest at the time of download, and the workflow stops if a file
+has changed since the manifest was created.
 
-```{r NHDPlusV2-HUC4, echo=F, fig.cap="NHD HUC4 map for the United States and territories, courtesy of the USGS.", fig.alt="Drawing of the Continental United States with HUC2 boundaries indicated with thick red lines and HUC4 boundaries indcated with thinner red lines. Insets of HUC2 and HUC4 shown for Alaska, Hawaii, Caribbean Region, South Pacific Region."}
+```{r NHD-HUC4, echo=F, fig.cap="NHD HUC4 map for the United States and territories, courtesy of the USGS.", fig.alt="Drawing of the Continental United States with HUC2 boundaries indicated with thick red lines and HUC4 boundaries indcated with thinner red lines. Insets of HUC2 and HUC4 shown for Alaska, Hawaii, Caribbean Region, South Pacific Region."}
 knitr::include_graphics("https://d9-wret.s3.us-west-2.amazonaws.com/assets/palladium/production/s3fs-public/thumbnails/image/WBD_SubRegions_24x18.png")
 ```
 
 For every HUC4 in the United States and territories (Figure
-\@ref(fig:NHDPlusV2-HUC4)), all waterbodies are limited to those with [NHD
+\@ref(fig:NHD-HUC4)), all waterbodies are limited to those with [NHD
 Waterbody
 Subtypes](https://www.usgs.gov/ngp-standards-and-specifications/national-hydrography-dataset-nhd-data-dictionary-feature-classes)
 belonging to the following groups: 390 (lake/pond) and 436 (reservoir) that are
@@ -95,8 +99,22 @@ waterbodies. This is a
 `r format(round((nrow(a_poi_with_flags)-56792)*100/56792, 0), big.mark = ",")`
 percent increase over the 56,792 lakes included in the original AquaSat product.
 
+Waterbodies that cross HUC4 boundaries are included in the GeoPackage of each
+HUC4 they intersect. These waterbodies are retained once, assigned to the HUC4
+that matches the first four digits of the waterbody's reach code when available,
+otherwise to the lowest-numbered HUC4.
+
 For each waterbody, the pole of inaccessibility (see Section \@ref(poi)) and
 distance-to-shore radius was calculated using the `polylabelr::poi()` function.
+
+Each waterbody is assigned a unique identifier, `lakeSR_id`, which is the
+waterbody's HUC4 and a sequential number within that HUC4 (e.g. `1019_25`).
+Within each HUC4, the sequential numbers are assigned in order of the NHD
+permanent identifier, so that the `lakeSR_id` can be reproduced from the source
+data. The `lakeSR_id` is the identifier used across all lakeSR data products.
+The NHD permanent identifier for each waterbody is provided in the `nhd_id`
+column of the lakeSR site file to link lakeSR locations to the NHD Best
+Resolution waterbody features.
 
 ### Updates in AquaMatch
 
@@ -131,15 +149,24 @@ For lakeSR, we use POI to determine the point in a waterbody that is furthest
 from the shoreline using the `polylabelr::poi()` function [@larsson2024], which
 calculates a point in space and the radius of the circle used to define the POI.
 
-The `poi()` function can sometimes attribute a POI to a location other than the
-point furthest away from a shoreline. This appears to occur in features with a
-very large number of indices (due to sheer area or geomorphological complexity);
-however the points calculated should be an acceptable proxy for deep lake
-conditions operating under the assumption that lake depth increases as distance
-from shore increases. No action was taken to correct or enumerate instances
-where this occurred within our dataset given the assumption that the point is
-still far from shore (though not always the “farthest”) and there is no obvious
-programmatic way to identify these points. Additionally, we did not compare the
+Waterbody polygons are passed to `poi()` with islands represented as holes in
+the polygon, so that the distance-to-shore accounts for island shorelines. For
+waterbodies represented by multiple polygon parts, the POI is calculated for
+each part and the POI with the greatest distance-to-shore is retained. The POI
+is calculated with a precision of 1 centimeter. Every POI is checked to confirm
+that it falls within its own waterbody polygon. In the rare case that the POI
+cannot be calculated or is not contained within the waterbody polygon, a point
+guaranteed to be within the polygon is used instead (calculated with
+`sf::st_point_on_surface()`), and the distance-to-shore is calculated for that
+point, so that no waterbody is excluded from lakeSR due to a failed POI
+calculation. In the current version of lakeSR
+(`lakeSR_poi_with_flags_2026-10-20.csv`), the POI was successfully calculated
+and contained within the waterbody polygon for all waterbodies, so no locations
+were derived from a point on surface.
+
+The POI is an acceptable proxy for deep lake conditions operating under the
+assumption that lake depth increases as distance from shore increases.
+Additionally, we did not compare the
 LimnoSat-US locations with AquaMatch_lakeSR locations (even for pseudonymous
 lakes) since the spatial extent of the polygons used do not share geometries and
 comparing locations between these products was outside of the scope of lakeSR at
@@ -147,23 +174,25 @@ this time.
 
 ### Technical Implementation of lakeSR
 
-The processing begins by acquiring the polygons of all US states and territories
-using the {tigris} package [@walker2025]. These polygons are used to acquire a
-list of HUC4s that intersect with each municipal boundary using the
-`nhdplusTools::get_huc()` function, which are then reduced to distinct HUC4's
-and transformed into a vector of HUC4s. HUC4s are then split into CONUS (HUC4 \<
-1900) and oCONUS (HUC4 ≥ 1900) groups. To efficiently calculate the POI across
-hundreds of HUC4s, we use the {targets} dynamic branching feature to iterate
-over each HUC4. For each HUC4, the NHDPlusV2 (CONUS) or NHD Best Resolution
-(oCONUS) waterbodies are acquired and filtered for lake/ponds and reservoirs of
-at least 1 hectare in area or 4 hectares for intermittent lake/ponds or
-reservoirs.
+The processing begins by listing all NHD Best Resolution HU4 GeoPackages
+available on The National Map's public data repository, which defines the HUC4s
+included in lakeSR and is saved as the manifest file described in Section
+\@ref(waterbodies). To efficiently calculate the POI across hundreds of HUC4s,
+we use the {targets} dynamic branching feature to iterate over each HUC4. For
+each HUC4, the GeoPackage is downloaded, and the `NHDWaterbody` layer is read
+and filtered for lake/ponds and reservoirs of at least 1 hectare in area or 4
+hectares for intermittent lake/ponds or reservoirs. The downloaded files are
+deleted once the POIs for the HUC4 have been calculated. After all HUC4s have
+been processed, waterbodies that occur in more than one HUC4 are reduced to a
+single record and the `lakeSR_id` is assigned (see Section
+\@ref(waterbodies)).
 
 In order to accurately calculate distance-to-shore when using the
 `polylabelr::poi()` function as described in Section \@ref(waterbodies), each
 waterbody was converted to the proper Universal Transverse Mercator ("UTM")
-projection calculated from the mean longitudinal value of the polygon vertices
-prior to applying the poi() function. By using the point-local UTM projection,
+projection calculated from the center of the polygon's bounding box prior to
+applying the poi() function. Any invalid polygon geometries are repaired in the
+UTM projection using `sf::st_make_valid()`. By using the point-local UTM projection,
 we decrease distortion expected from any single coordinate reference system used
 to represent all of the locations from which we have lakes. The latitude and
 longitude values of the POI were transformed to decimal degrees in World
@@ -240,21 +269,9 @@ WI <- states(progress_bar = FALSE) %>%
 poi_sf <- st_as_sf(a_poi_with_flags, 
                    coords = c("poi_Longitude", "poi_Latitude"), 
                    crs = "EPSG:4326")
-# filter to WI
-WI_poi <- poi_sf[WI, ]
-
-# get the waterbodies from the NHD and filter like in workflow
-WI_wbd <- get_waterbodies(AOI = WI) %>% 
-  filter(areasqkm > 0.01, ftype %in% c("LakePond", "Reservoir"))
-intermittent_small <- WI_wbd %>% 
-  filter(areasqkm < 0.04, fcode %in% c(39001, 39005, 39006, 43614))
-
-# join, and remove Great Lakes
-WI_wbd_noGL <- WI_wbd[!WI_wbd$comid %in% intermittent_small$comid, ]
-WI_wbd_noGL <- st_make_valid(WI_wbd_noGL) %>% 
+# filter to WI, removing the Great Lakes
+WI_poi <- poi_sf[WI, ] %>%
   filter(areasqkm < 700)
-# and make sure they have associated pois
-WI_wbd_poi <- WI_wbd_noGL[WI_poi, ]
 
 # load in Wisconsin lakes in hydrolakes
 WI_HL <- read_sf("../bookdown/data/WI_hydrolakes.gpkg") %>% 
@@ -277,7 +294,7 @@ Wisconsin, whereas AquaMatch via the lakeSR product includes
 `r format(nrow(WI_poi), big.mark = ",")` (Figure \@ref(fig:WI-lakes)) -
 accounting for a majority of the state's freshwater water bodies.
 
-```{r WI-lakes, echo=F, fig.cap="Deepest point of Wisconsin lakes included in LimnoSat-US defined by the Hydrolakes data product (left) and those included in AquaMatch via lakeSR defined by the NHDPlusV2 data product (right). Deepest point for each lake is indicated with a black dot, spatial histogram of density by longitude and latitude presented below the maps.", fig.height=7, fig.alt="This is a multi-panel figure, on the top row, two maps of the state of Wisconsin with dots representing all the lakes included in the lakeSR dataset. The top left represents the water bodies included in LimnoSat, the top right is those included in AquaSat v2, which has a higher density of dots. Below these two maps are histograms of the number of lakes with an x axis for Longitude (bottom left) or Latitude (bottom right), showing the difference in count between the LimnoSat and AquaSat v2 data products."}
+```{r WI-lakes, echo=F, fig.cap="Deepest point of Wisconsin lakes included in LimnoSat-US defined by the Hydrolakes data product (left) and those included in AquaMatch via lakeSR defined by the NHD Best Resolution data product (right). Deepest point for each lake is indicated with a black dot, spatial histogram of density by longitude and latitude presented below the maps.", fig.height=7, fig.alt="This is a multi-panel figure, on the top row, two maps of the state of Wisconsin with dots representing all the lakes included in the lakeSR dataset. The top left represents the water bodies included in LimnoSat, the top right is those included in AquaSat v2, which has a higher density of dots. Below these two maps are histograms of the number of lakes with an x axis for Longitude (bottom left) or Latitude (bottom right), showing the difference in count between the LimnoSat and AquaSat v2 data products."}
 
 # convert for ggplot
 coords_limno <- st_coordinates(WI_HL_DP)
@@ -346,7 +363,6 @@ hist_y_as <- ggplot(coords_as_df, aes(x = Y)) +
 
 map_as <- ggplot() +
   geom_sf(data = WI_for_viz, fill = NA, color = "black") +
-  geom_sf(data = WI_wbd_poi, fill = "lightblue", color = "black") +
   geom_point(data = coords_as_df, 
              aes(x = X, y = Y), 
              color = "black", 

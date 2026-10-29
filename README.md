@@ -31,15 +31,21 @@ listed below with a description of what each group does.
 
 ### a_Calculate_Centers
 
-This {targets} list calculates "Point of Inaccessibility", also known as Cheybyshev 
-Center for all lakes/reservoirs/impoundments greater than 1ha in surface area 
-using the NHDPlus polygons using the {nhdplusTools} package and the `poi()` 
-function in the {polylabelr} package. Alaska, HI, and some other HUC4 waterbodies 
-are not included in the NHDPlusv2, so they are downloaded by url from The 
-National Map and are processed in a separate target. 
+This {targets} list calculates the "Point of Inaccessibility", also known as the 
+Chebyshev center, for all lakes/reservoirs greater than 1ha in surface area 
+(4ha for intermittent lakes/reservoirs) in the USGS National Hydrography Dataset
+(NHD) Best Resolution product using the `poi()` function in the {polylabelr} 
+package. The NHD Best Resolution HU4 GeoPackages are downloaded directly from 
+The National Map. The list of files, with each file's last-modified date and 
+ETag, is saved as a manifest (`a_Calculate_Centers/out/lakeSR_NHD_manifest_[centers_version].csv`)
+to document the exact source data for each centers version. Each waterbody is 
+assigned a `lakeSR_id` (HUC4 and a sequential number within the HUC4, assigned 
+in order of the NHD permanent identifier).
 
 *Timing Note*
-This group of targets will take a few hours to complete.
+This group of targets downloads ~40 GB of NHD files (each HU4 file is deleted 
+once processed) and will take an hour or more to complete, depending on 
+download speed and the number of cores available.
 
 *Configuration Note*
 This group is either run completely or pulled from exisiting files based on lakeSR 

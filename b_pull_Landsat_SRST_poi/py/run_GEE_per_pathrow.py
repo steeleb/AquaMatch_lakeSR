@@ -1,3 +1,10 @@
+# Landsat C2 SR/ST pull for one WRS2 path-row. Sends one site export per
+# mission group and chunk that summarizes all configured DSWE variants (DSWE1,
+# DSWE1a, DSWE3). All per-image processing (masks, hillshade, hillshadow, DSWE)
+# is done once per image for all variants. Locations are sorted spatially before
+# chunking, so chunks share fewer image tiles. Downloaded files are split into
+# per-variant files with split_combined_dswe() in c_collate_Landsat_data/src/.
+
 #import modules
 import ee
 import time
@@ -7,7 +14,7 @@ from pandas import read_csv
 import math
 
 # LOAD ALL THE CUSTOM FUNCTIONS -----------------------------------------------
-# DSWE functions begin at 'def DSWE'; reflectance pull functions at 'def ref_pull_'
+# DSWE functions begin at 'def DSWE'; reflectance pull function at 'def ref_pull_combined'
 # config and GEE pull code begin at 'IMPORT CONFIG VARIABLES'
 
 def csv_to_eeFeat(df, proj):
@@ -479,10 +486,16 @@ def calc_hill_shadows(image, geo):
       pixel. output 1 where pixels are illumunated and 0 where they are shadowed.
   """
   MergedDEM = ee.Image("MERIT/DEM/v1_0_3").clip(geo.buffer(3000))
-  hillShadow = ee.Terrain.hillShadow(MergedDEM, 
+  # neighborhood size of 100 pixels (~3 km at the 30 m reduction scale). With
+  # 30 pixels (~900 m), shadows cast by terrain farther away were missed or not
+  # depending on how GEE split up the request, e.g. at low sun in SE Alaska,
+  # where a site could be 0% or 93% shadowed. 100 removes these large errors
+  # for ~2% more EECU; 200 was no more accurate (see
+  # scratch/gee_test/hillshadow_scenes.py)
+  hillShadow = ee.Terrain.hillShadow(MergedDEM,
     ee.Number(image.get('SUN_AZIMUTH')),
-    ee.Number(90).subtract(image.get('SUN_ELEVATION')), 
-    30)
+    ee.Number(90).subtract(image.get('SUN_ELEVATION')),
+    100)
   hillShadow = hillShadow.rename(['hillShadow'])
   return hillShadow
 
@@ -499,25 +512,81 @@ def remove_geo(image):
   return image.setGeometry(None)
 
 
-## Set up the reflectance pull
-def ref_pull_457_DSWE1(image, feat):
-  """ This function applies all functions to the Landsat 4-7 ee.ImageCollection, extracting
-  summary statistics for each geometry area where the DSWE value is 1, high confidence
-  water
+
+
+## Set up the combined reflectance pull
+# The DSWE1, DSWE1a, and DSWE3 pulls share all of the per-image processing
+# (masks, hillshade, hillshadow, DSWE) and differ only in the water mask used
+# for the summaries and diagnostic counts. Here that shared processing is done
+# once per image and summaries for each DSWE variant are calculated in a single
+# reduceRegions call. Variant-specific outputs are prefixed with the variant
+# name and two underscores (e.g. 'DSWE1a__med_Blue'); outputs that are the same
+# for every variant (pCount_dswe*, prop_clouds, prop_hillShadow, mean_hillShade)
+# are not prefixed. Once split by variant (see split_combined_dswe() in
+# c_collate_Landsat_data/src/), the output has the same format as the
+# per-variant exports of previous versions of this script, and for the same
+# site order and hillshadow settings, the same values.
+
+def get_variant_cols(group, variants):
+  """ Get the output column names of ref_pull_combined, in the order of the
+  reducer outputs
+
+  Args:
+      group: 'LS457' or 'LS89'
+      variants: list of DSWE variants, any of 'DSWE1', 'DSWE1a', 'DSWE3'
+
+  Returns:
+      dictionary of lists of band names for each summary type
+  """
+  if group == 'LS457':
+    sr_bands = ['Blue', 'Green', 'Red', 'Nir', 'Swir1', 'Swir2', 'SurfaceTemp']
+    diag = ['high_opac', 'unreal_val', 'sun_glint', 'ir_glint']
+  else:
+    sr_bands = ['Aerosol', 'Blue', 'Green', 'Red', 'Nir', 'Swir1', 'Swir2', 'SurfaceTemp']
+    diag = ['high_aero', 'unreal_val', 'sun_glint', 'ir_glint', 'aero_zero', 'aero_thresh']
+  diag = diag + ['blue_zero', 'blue_thresh', 'green_zero', 'green_thresh',
+    'red_zero', 'red_thresh', 'nir_zero', 'nir_thresh',
+    'swir1_zero', 'swir1_thresh', 'swir2_zero', 'swir2_thresh',
+    'blue_glint', 'green_glint', 'red_glint', 'nir_glint', 'swir1_glint', 'swir2_glint',
+    'nir_ir_glint', 'swir1_ir_glint', 'swir2_ir_glint']
+  return {
+    'sr_bands': sr_bands,
+    'med': [v + '__med_' + b for v in variants for b in sr_bands],
+    'min': [v + '__min_SurfaceTemp' for v in variants],
+    'sd': [v + '__sd_' + b for v in variants for b in sr_bands],
+    'mean': [v + '__mean_' + b for v in variants for b in sr_bands],
+    'diag': diag,
+    'pCount': [v + '__pCount_' + x for v in variants for x in diag]
+  }
+
+
+def ref_pull_combined(image, feat, group, variants):
+  """ This function applies all functions to the Landsat 4-7 or 8-9
+  ee.ImageCollection, extracting summary statistics for each geometry area for
+  each requested DSWE variant: DSWE1 (high confidence water), DSWE1a (DSWE1 or
+  algal threshold met), DSWE3 (vegetated water)
 
   Args:
       image: ee.Image of an ee.ImageCollection
       feat: ee.FeatureGeometry of the buffered locations
+      group: 'LS457' or 'LS89'
+      variants: list of DSWE variants, any of 'DSWE1', 'DSWE1a', 'DSWE3'
 
   Returns:
-      summaries for band data within any given geometry area where the DSWE is 1
+      summaries for band data within any given geometry area for each DSWE
+      variant
   """
+  cols = get_variant_cols(group, variants)
   # process image with cfmask
   # where the mask is >= 1 (dilated cloud, cloud, cloud shadow, snow)
   # call that 1 (otherwise 0) and rename as clouds.
   clouds = add_cf_mask(image).select('cfmask').gte(1).rename('clouds')
-  # add mask FOR low opacity, realistic values, sun glint, ir glint
-  opac = add_opac_mask(image).select('opac').eq(1).rename('low_opac')
+  # add mask FOR low opacity (LS457) or low aerosol (LS89), realistic values,
+  # sun glint, ir glint
+  if group == 'LS457':
+    atmos = add_opac_mask(image).select('opac').eq(1).rename('low_opac')
+  else:
+    atmos = add_sr_aero_mask(image).select('aero').eq(1).rename('low_aero')
   real = add_realistic_mask(image).select('real').eq(1).rename('is_real')
   no_glint = add_sun_glint_mask(image).select('no_glint').eq(1)
   ir_glint = add_ir_glint_flag(image).select('ir_glint').eq(1)
@@ -528,1264 +597,151 @@ def ref_pull_457_DSWE1(image, feat):
   # apply dswe function
   d = DSWE(image).select('dswe')
 
-  # create additive masks for dswe>0 (water of any type)
-  # hs = 1, fully illuminated pixels
-  gt0 = (d.gt(0).rename('dswe_gt0')
-    .updateMask(hs.eq(1))
-    # add cloud, opac and real
-    .updateMask(clouds.eq(0))
-    .updateMask(opac.eq(1))
-    .updateMask(real.eq(1))
-    .updateMask(no_glint.eq(1))
-    .selfMask()
-    )
-    
-  # create additive masks for dswe==1 (confident open water)
-  # hs = 1, fully illuminated pixels
-  dswe1 = (d.eq(1).rename('dswe1')
-    .updateMask(hs.eq(1))
-    # add cloud, opac and real
-    .updateMask(clouds.eq(0))
-    .updateMask(opac.eq(1))
-    .updateMask(real.eq(1))
-    .updateMask(no_glint.eq(1))
-    .selfMask()
-    )
-    
-  # create additive masks for dswe==3 (confident vegetated water)
-  # hs = 1, fully illuminated pixels
-  dswe3 = (d.eq(3).rename('dswe3')
-    .updateMask(hs.eq(1))
-    # add cloud, opac and real
-    .updateMask(clouds.eq(0))
-    .updateMask(opac.eq(1))
-    .updateMask(real.eq(1))
-    .updateMask(no_glint.eq(1))
-    .selfMask()
-    )
-    
+  def qa_mask(img):
+    # hs = 1, fully illuminated pixels; add cloud, opac/aero, real and glint
+    return (img
+      .updateMask(hs.eq(1))
+      .updateMask(clouds.eq(0))
+      .updateMask(atmos.eq(1))
+      .updateMask(real.eq(1))
+      .updateMask(no_glint.eq(1))
+      .selfMask())
+
+  # create additive masks for dswe>0 (water of any type), dswe==1 (confident
+  # open water), and dswe==3 (confident vegetated water)
+  gt0 = qa_mask(d.gt(0).rename('dswe_gt0'))
+  dswe1 = qa_mask(d.eq(1).rename('dswe1'))
+  dswe3 = qa_mask(d.eq(3).rename('dswe3'))
+
   # define algae where DSWE > 1 and red/green threshold met
   grn_alg_thrsh = image.select('Green').gt(0.05)
   red_alg_thrsh = image.select('Red').lt(0.04)
   alg = (d.gt(1).rename('algae')
     .And(grn_alg_thrsh.eq(1))
     .And(red_alg_thrsh.eq(1))
-    # add cloud, opac and real
+    # add cloud, opac/aero and real
     .updateMask(clouds.eq(0))
-    .updateMask(opac.eq(1))
+    .updateMask(atmos.eq(1))
     .updateMask(real.eq(1))
     .updateMask(no_glint.eq(1))
     )
-    
+
   # create additive mask for dswe1a: dswe = 1 or algal threshold met
-  # hs = 1, fully illuminated pixels
-  dswe1a = (d.eq(1)
-    .Or(alg.eq(1))
-    .rename('dswe1a')
-    .updateMask(hs.eq(1))
-    # add cloud, opac and real
-    .updateMask(clouds.eq(0))
-    .updateMask(opac.eq(1))
-    .updateMask(real.eq(1))
-    .updateMask(no_glint.eq(1))
-    .selfMask()
+  dswe1a = qa_mask(d.eq(1).Or(alg.eq(1)).rename('dswe1a'))
+
+  # the summary mask and the water area for the diagnostic counts per variant.
+  # The DSWE1a water area uses the algal thresholds directly rather than 'alg',
+  # because 'alg' has the realistic value and sun glint masks applied and would
+  # hide the pixels being counted
+  summary_mask = {'DSWE1': dswe1, 'DSWE1a': dswe1a, 'DSWE3': dswe3}
+  water_area = {
+    'DSWE1': d.eq(1),
+    'DSWE1a': d.eq(1).Or(d.gt(1).And(grn_alg_thrsh.eq(1)).And(red_alg_thrsh.eq(1))),
+    'DSWE3': d.eq(3)
+  }
+
+  # diagnostic flags, prior to masking to the water area
+  band_flags = {
+    'blue_zero': image.select('Blue').lt(0),
+    'blue_thresh': image.select('Blue').lt(-0.01),
+    'green_zero': image.select('Green').lt(0),
+    'green_thresh': image.select('Green').lt(-0.01),
+    'red_zero': image.select('Red').lt(0),
+    'red_thresh': image.select('Red').lt(-0.01),
+    'nir_zero': image.select('Nir').lt(0),
+    'nir_thresh': image.select('Nir').lt(-0.01),
+    'swir1_zero': image.select('Swir1').lt(0),
+    'swir1_thresh': image.select('Swir1').lt(-0.01),
+    'swir2_zero': image.select('Swir2').lt(0),
+    'swir2_thresh': image.select('Swir2').lt(-0.01),
+    # >= 0.2
+    'blue_glint': image.select('Blue').gte(0.2),
+    'green_glint': image.select('Green').gte(0.2),
+    'red_glint': image.select('Red').gte(0.2),
+    'nir_glint': image.select('Nir').gte(0.2),
+    'swir1_glint': image.select('Swir1').gte(0.2),
+    'swir2_glint': image.select('Swir2').gte(0.2),
+    # ir bands >= 0.1
+    'nir_ir_glint': image.select('Nir').gte(0.1),
+    'swir1_ir_glint': image.select('Swir1').gte(0.1),
+    'swir2_ir_glint': image.select('Swir2').gte(0.1),
+    # pixels that fail the realistic value or sun glint masks, or are flagged
+    # for ir glint
+    'unreal_val': real.eq(0),
+    'sun_glint': no_glint.eq(0),
+    'ir_glint': ir_glint
+  }
+  if group == 'LS89':
+    band_flags['aero_zero'] = image.select('Aerosol').lt(0)
+    band_flags['aero_thresh'] = image.select('Aerosol').lt(-0.01)
+
+  # summary and diagnostic bands per variant
+  sr = cols['sr_bands']
+  variant_bands = {}
+  for v in variants:
+    summ = (image.select(sr, [v + '__med_' + b for b in sr])
+      .addBands(image.select(['SurfaceTemp'], [v + '__min_SurfaceTemp']))
+      .addBands(image.select(sr, [v + '__sd_' + b for b in sr]))
+      .addBands(image.select(sr, [v + '__mean_' + b for b in sr]))
+      .updateMask(summary_mask[v]))
+    w = water_area[v]
+    for x in cols['diag']:
+      if x in ['high_opac', 'high_aero']:
+        # pixels within the water area that fail the opacity/aerosol mask
+        # (hillshadow and cloud masks applied)
+        b = (atmos.eq(0).rename(v + '__pCount_' + x)
+          .updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(w).selfMask())
+      else:
+        # hillshadow, cloud and opacity/aerosol masks applied
+        b = (band_flags[x].rename(v + '__pCount_' + x)
+          .updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(atmos.eq(1))
+          .updateMask(w).selfMask())
+      summ = summ.addBands(b)
+    variant_bands[v] = summ
+
+  allBands = variant_bands[variants[0]]
+  for v in variants[1:]:
+    allBands = allBands.addBands(variant_bands[v])
+  allBands = (allBands
+    # add bands back in for QA (prior to masking of dswe/hs/f/r)
+    .addBands(gt0)
+    .addBands(dswe1)
+    .addBands(dswe3)
+    .addBands(dswe1a)
+    .addBands(clouds)
+    .addBands(hs.eq(0).rename('hillShadow')) # invert so prop_hillShadow = proportion shaded
+    .addBands(h)
     )
-    
-  # create masks for each band for <0 and <-0.01
-  blue_zero = image.select('Blue').lt(0).rename('blue_zero').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(d.eq(1)).selfMask()
-  blue_thresh = image.select('Blue').lt(-0.01).rename('blue_thresh').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(d.eq(1)).selfMask()
-  green_zero = image.select('Green').lt(0).rename('green_zero').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(d.eq(1)).selfMask()
-  green_thresh = image.select('Green').lt(-0.01).rename('green_thresh').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(d.eq(1)).selfMask()
-  red_zero = image.select('Red').lt(0).rename('red_zero').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(d.eq(1)).selfMask()
-  red_thresh = image.select('Red').lt(-0.01).rename('red_thresh').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(d.eq(1)).selfMask()
-  nir_zero = image.select('Nir').lt(0).rename('nir_zero').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(d.eq(1)).selfMask()
-  nir_thresh = image.select('Nir').lt(-0.01).rename('nir_thresh').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(d.eq(1)).selfMask()
-  swir1_zero = image.select('Swir1').lt(0).rename('swir1_zero').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(d.eq(1)).selfMask()
-  swir1_thresh = image.select('Swir1').lt(-0.01).rename('swir1_thresh').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(d.eq(1)).selfMask()
-  swir2_zero = image.select('Swir2').lt(0).rename('swir2_zero').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(d.eq(1)).selfMask()
-  swir2_thresh = image.select('Swir2').lt(-0.01).rename('swir2_thresh').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(d.eq(1)).selfMask()
 
-  # create masks for each band for >=0.2
-  blue_glint = image.select('Blue').gte(0.2).rename('blue_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(d.eq(1)).selfMask()
-  green_glint = image.select('Green').gte(0.2).rename('green_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(d.eq(1)).selfMask()
-  red_glint = image.select('Red').gte(0.2).rename('red_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(d.eq(1)).selfMask()
-  nir_glint = image.select('Nir').gte(0.2).rename('nir_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(d.eq(1)).selfMask()
-  swir1_glint = image.select('Swir1').gte(0.2).rename('swir1_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(d.eq(1)).selfMask()
-  swir2_glint = image.select('Swir2').gte(0.2).rename('swir2_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(d.eq(1)).selfMask()
+  # reduceRegions matches image bands to reducer inputs by position, so order
+  # the bands to match the reducer below. A summary band stays first so the
+  # default projection is the Landsat projection, as in ref_pull_*
+  pixOut = allBands.select(cols['med'] + cols['min'] + cols['sd'] + cols['mean']
+    + cols['pCount'] + ['dswe_gt0', 'dswe1', 'dswe3', 'dswe1a']
+    + ['clouds', 'hillShadow', 'hillShade'])
 
-  # create masks for ir bands >=0.1
-  nir_ir_glint = image.select('Nir').gte(0.1).rename('nir_ir_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(d.eq(1)).selfMask()
-  swir1_ir_glint = image.select('Swir1').gte(0.1).rename('swir1_ir_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(d.eq(1)).selfMask()
-  swir2_ir_glint = image.select('Swir2').gte(0.1).rename('swir2_ir_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(d.eq(1)).selfMask()
-  
-  # count pixels within the water area that fail the realistic value or sun
-  # glint masks, or are flagged for ir glint (hillshadow, cloud and opacity masks applied)
-  unreal_val = real.eq(0).rename('unreal_val').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(d.eq(1)).selfMask()
-  sun_glint = no_glint.eq(0).rename('sun_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(d.eq(1)).selfMask()
-  ir_glint_water = ir_glint.rename('ir_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(d.eq(1)).selfMask()
-  # count pixels within the water area that fail the opacity mask (hillshadow
-  # and cloud masks applied)
-  high_opac = opac.eq(0).rename('high_opac').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(d.eq(1)).selfMask()
-
-  pixOut = (image.select(['Blue', 'Green', 'Red', 'Nir', 'Swir1', 'Swir2', 
-                        'SurfaceTemp'],
-                        ['med_Blue', 'med_Green', 'med_Red', 'med_Nir', 'med_Swir1', 'med_Swir2', 
-                        'med_SurfaceTemp'])
-            .addBands(image.select(['SurfaceTemp'],
-                                    ['min_SurfaceTemp']))
-            .addBands(image.select(['Blue', 'Green', 'Red', 
-                                    'Nir', 'Swir1', 'Swir2', 'SurfaceTemp'],
-                                  ['sd_Blue', 'sd_Green', 'sd_Red', 
-                                  'sd_Nir', 'sd_Swir1', 'sd_Swir2', 'sd_SurfaceTemp']))
-            .addBands(image.select(['Blue', 'Green', 'Red', 'Nir', 
-                                    'Swir1', 'Swir2', 
-                                    'SurfaceTemp'],
-                                  ['mean_Blue', 'mean_Green', 'mean_Red', 'mean_Nir', 
-                                  'mean_Swir1', 'mean_Swir2', 
-                                  'mean_SurfaceTemp']))
-            # mask the image for dswe
-            .updateMask(dswe1) # high confidence water mask
-            # add bands back in for QA (prior to masking of dswe/hs/f/r)
-            .addBands(gt0) 
-            .addBands(dswe1)
-            .addBands(dswe3)
-            .addBands(dswe1a)
-            .addBands(high_opac)
-            .addBands(unreal_val)
-            .addBands(sun_glint)
-            .addBands(ir_glint_water)
-            .addBands(blue_zero)
-            .addBands(blue_thresh)
-            .addBands(green_zero)
-            .addBands(green_thresh)
-            .addBands(red_zero)
-            .addBands(red_thresh)
-            .addBands(nir_zero)
-            .addBands(nir_thresh)
-            .addBands(swir1_zero)
-            .addBands(swir1_thresh)
-            .addBands(swir2_zero)
-            .addBands(swir2_thresh)
-            .addBands(blue_glint)
-            .addBands(green_glint)
-            .addBands(red_glint)
-            .addBands(nir_glint)
-            .addBands(swir1_glint)
-            .addBands(swir2_glint)
-            .addBands(nir_ir_glint)
-            .addBands(swir1_ir_glint)
-            .addBands(swir2_ir_glint)
-            .addBands(clouds) 
-            .addBands(hs.eq(0).rename('hillShadow')) # invert so prop_hillShadow = proportion shaded
-            .addBands(h)
-            ) 
   combinedReducer = (ee.Reducer.median().unweighted()
-      .forEachBand(pixOut.select(['med_Blue', 'med_Green', 'med_Red', 
-            'med_Nir', 'med_Swir1', 'med_Swir2', 'med_SurfaceTemp']))
+      .forEachBand(pixOut.select(cols['med']))
     .combine(ee.Reducer.min().unweighted()
-      .forEachBand(pixOut.select(['min_SurfaceTemp'])), sharedInputs = False)
+      .forEachBand(pixOut.select(cols['min'])), sharedInputs = False)
     .combine(ee.Reducer.stdDev().unweighted()
-      .forEachBand(pixOut.select(['sd_Blue', 'sd_Green', 'sd_Red', 'sd_Nir', 'sd_Swir1', 'sd_Swir2', 'sd_SurfaceTemp'])), 
-      sharedInputs = False)
+      .forEachBand(pixOut.select(cols['sd'])), sharedInputs = False)
     .combine(ee.Reducer.mean().unweighted()
-      .forEachBand(pixOut.select(['mean_Blue', 'mean_Green', 'mean_Red', 
-              'mean_Nir', 'mean_Swir1', 'mean_Swir2', 'mean_SurfaceTemp'])), sharedInputs = False)
+      .forEachBand(pixOut.select(cols['mean'])), sharedInputs = False)
     .combine(ee.Reducer.count().unweighted()
-      .forEachBand(pixOut.select(['dswe_gt0', 'dswe1', 'dswe3', 'dswe1a', 
-              'high_opac', 'unreal_val',
-              'sun_glint', 'ir_glint',
-              'blue_zero', 'blue_thresh', 'green_zero', 'green_thresh', 'red_zero', 'red_thresh',
-              'nir_zero', 'nir_thresh', 'swir1_zero', 'swir1_thresh', 'swir2_zero', 'swir2_thresh',
-              'blue_glint', 'green_glint', 'red_glint', 'nir_glint', 'swir1_glint', 'swir2_glint',
-              'nir_ir_glint', 'swir1_ir_glint', 'swir2_ir_glint'])), 
+      .forEachBand(pixOut.select(cols['pCount'])), sharedInputs = False)
+    .combine(ee.Reducer.count().unweighted()
+      .forEachBand(pixOut.select(['dswe_gt0', 'dswe1', 'dswe3', 'dswe1a'])),
       outputPrefix = 'pCount_', sharedInputs = False)
     .combine(ee.Reducer.mean().unweighted()
-      .forEachBand(pixOut.select(['clouds', 'hillShadow'])), 
+      .forEachBand(pixOut.select(['clouds', 'hillShadow'])),
       outputPrefix = 'prop_', sharedInputs = False)
     .combine(ee.Reducer.mean().unweighted()
-      .forEachBand(pixOut.select(['hillShade'])), 
+      .forEachBand(pixOut.select(['hillShade'])),
       outputPrefix = 'mean_', sharedInputs = False)
     )
   # Collect median reflectance and occurance values
   # Make a cloud score, and get the water pixel count
-  lsout = (pixOut.reduceRegions(feat, combinedReducer, 30))
-  out = lsout.map(remove_geo)
-  return out
-
-
-## Set up the reflectance pull
-def ref_pull_457_DSWE1a(image, feat):
-  """ This function applies all functions to the Landsat 4-7 ee.ImageCollection, extracting
-  summary statistics for each geometry area where the DSWE value is 1 (high confidence water)
-  or where the algal mask threshold is met
-
-  Args:
-      image: ee.Image of an ee.ImageCollection
-      feat: ee.FeatureGeometry of the buffered locations
-
-  Returns:
-      summaries for band data within any given geometry area where the DSWE value is 1 or where
-      the algal mask threshold is met
-  """
-  # process image with cfmask
-  # where the mask is >= 1 (dilated cloud, cloud, cloud shadow, snow)
-  # call that 1 (otherwise 0) and rename as clouds.
-  clouds = add_cf_mask(image).select('cfmask').gte(1).rename('clouds')
-  # add mask FOR low opacity, realistic values, sun glint, ir glint
-  opac = add_opac_mask(image).select('opac').eq(1).rename('low_opac')
-  real = add_realistic_mask(image).select('real').eq(1).rename('is_real')
-  no_glint = add_sun_glint_mask(image).select('no_glint').eq(1)
-  ir_glint = add_ir_glint_flag(image).select('ir_glint').eq(1)
-  # calculate hillshade
-  h = calc_hill_shades(image, wrs.geometry()).select('hillShade')
-  # calculate hillshadow
-  hs = calc_hill_shadows(image, wrs.geometry()).select('hillShadow')
-  
-  # apply dswe function
-  d = DSWE(image).select('dswe')
-  
-  # create additive masks for dswe>0 (water of any type)
-  # hs = 1, fully illuminated pixels
-  gt0 = (d.gt(0).rename('dswe_gt0')
-    .updateMask(hs.eq(1))
-    # add cloud, opac and real
-    .updateMask(clouds.eq(0))
-    .updateMask(opac.eq(1))
-    .updateMask(real.eq(1))
-    .updateMask(no_glint.eq(1))
-    .selfMask()
-    )
-    
-  # create additive masks for dswe==1 (confident open water)
-  # hs = 1, fully illuminated pixels
-  dswe1 = (d.eq(1).rename('dswe1')
-    .updateMask(hs.eq(1))
-    # add cloud, opac and real
-    .updateMask(clouds.eq(0))
-    .updateMask(opac.eq(1))
-    .updateMask(real.eq(1))
-    .updateMask(no_glint.eq(1))
-    .selfMask()
-    )
-    
-  # create additive masks for dswe==3 (confident vegetated water)
-  # hs = 1, fully illuminated pixels
-  dswe3 = (d.eq(3).rename('dswe3')
-    .updateMask(hs.eq(1))
-    # add cloud, opac and real
-    .updateMask(clouds.eq(0))
-    .updateMask(opac.eq(1))
-    .updateMask(real.eq(1))
-    .updateMask(no_glint.eq(1))
-    .selfMask()
-    )
-    
-  # define algae where DSWE > 1 and red/green threshold met
-  grn_alg_thrsh = image.select('Green').gt(0.05)
-  red_alg_thrsh = image.select('Red').lt(0.04)
-  alg = (d.gt(1).rename('algae')
-    .And(grn_alg_thrsh.eq(1))
-    .And(red_alg_thrsh.eq(1))
-    # add cloud, opac and real
-    .updateMask(clouds.eq(0))
-    .updateMask(opac.eq(1))
-    .updateMask(real.eq(1))
-    .updateMask(no_glint.eq(1))
-    )
-    
-  # create additive mask for dswe1a: dswe = 1 or algal threshold met
-  # hs = 1, fully illuminated pixels
-  dswe1a = (d.eq(1)
-    .Or(alg.eq(1))
-    .rename('dswe1a')
-    .updateMask(hs.eq(1))
-    # add cloud, opac and real
-    .updateMask(clouds.eq(0))
-    .updateMask(opac.eq(1))
-    .updateMask(real.eq(1))
-    .updateMask(no_glint.eq(1))
-    .selfMask()
-    )
-    
-  # DSWE1a water area for the diagnostic counts below. This uses the algal
-  # thresholds directly rather than 'alg', because 'alg' has the realistic
-  # value and sun glint masks applied and would hide the pixels being counted
-  water_1a = d.eq(1).Or(d.gt(1).And(grn_alg_thrsh.eq(1)).And(red_alg_thrsh.eq(1)))
-
-  # create masks for each band for <0 and <-0.01
-  blue_zero = image.select('Blue').lt(0).rename('blue_zero').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(water_1a).selfMask()
-  blue_thresh = image.select('Blue').lt(-0.01).rename('blue_thresh').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(water_1a).selfMask()
-  green_zero = image.select('Green').lt(0).rename('green_zero').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(water_1a).selfMask()
-  green_thresh = image.select('Green').lt(-0.01).rename('green_thresh').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(water_1a).selfMask()
-  red_zero = image.select('Red').lt(0).rename('red_zero').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(water_1a).selfMask()
-  red_thresh = image.select('Red').lt(-0.01).rename('red_thresh').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(water_1a).selfMask()
-  nir_zero = image.select('Nir').lt(0).rename('nir_zero').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(water_1a).selfMask()
-  nir_thresh = image.select('Nir').lt(-0.01).rename('nir_thresh').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(water_1a).selfMask()
-  swir1_zero = image.select('Swir1').lt(0).rename('swir1_zero').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(water_1a).selfMask()
-  swir1_thresh = image.select('Swir1').lt(-0.01).rename('swir1_thresh').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(water_1a).selfMask()
-  swir2_zero = image.select('Swir2').lt(0).rename('swir2_zero').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(water_1a).selfMask()
-  swir2_thresh = image.select('Swir2').lt(-0.01).rename('swir2_thresh').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(water_1a).selfMask()
-  
-  # create masks for each band for >=0.2
-  blue_glint = image.select('Blue').gte(0.2).rename('blue_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(water_1a).selfMask()
-  green_glint = image.select('Green').gte(0.2).rename('green_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(water_1a).selfMask()
-  red_glint = image.select('Red').gte(0.2).rename('red_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(water_1a).selfMask()
-  nir_glint = image.select('Nir').gte(0.2).rename('nir_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(water_1a).selfMask()
-  swir1_glint = image.select('Swir1').gte(0.2).rename('swir1_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(water_1a).selfMask()
-  swir2_glint = image.select('Swir2').gte(0.2).rename('swir2_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(water_1a).selfMask()
-
-  # create masks for ir bands >=0.1
-  nir_ir_glint = image.select('Nir').gte(0.1).rename('nir_ir_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(water_1a).selfMask()
-  swir1_ir_glint = image.select('Swir1').gte(0.1).rename('swir1_ir_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(water_1a).selfMask()
-  swir2_ir_glint = image.select('Swir2').gte(0.1).rename('swir2_ir_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(water_1a).selfMask()
-
-  # count pixels within the water area that fail the realistic value or sun
-  # glint masks, or are flagged for ir glint (hillshadow, cloud and opacity masks applied)
-  unreal_val = real.eq(0).rename('unreal_val').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(water_1a).selfMask()
-  sun_glint = no_glint.eq(0).rename('sun_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(water_1a).selfMask()
-  ir_glint_water = ir_glint.rename('ir_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(water_1a).selfMask()
-  # count pixels within the water area that fail the opacity mask (hillshadow
-  # and cloud masks applied)
-  high_opac = opac.eq(0).rename('high_opac').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(water_1a).selfMask()
-
-  pixOut = (image.select(['Blue', 'Green', 'Red', 'Nir', 'Swir1', 'Swir2',
-                        'SurfaceTemp'],
-                        ['med_Blue', 'med_Green', 'med_Red', 'med_Nir', 'med_Swir1', 'med_Swir2',
-                        'med_SurfaceTemp'])
-            .addBands(image.select(['SurfaceTemp'],
-                                    ['min_SurfaceTemp']))
-            .addBands(image.select(['Blue', 'Green', 'Red',
-                                    'Nir', 'Swir1', 'Swir2', 'SurfaceTemp'],
-                                  ['sd_Blue', 'sd_Green', 'sd_Red',
-                                  'sd_Nir', 'sd_Swir1', 'sd_Swir2', 'sd_SurfaceTemp']))
-            .addBands(image.select(['Blue', 'Green', 'Red', 'Nir',
-                                    'Swir1', 'Swir2',
-                                    'SurfaceTemp'],
-                                  ['mean_Blue', 'mean_Green', 'mean_Red', 'mean_Nir',
-                                  'mean_Swir1', 'mean_Swir2',
-                                  'mean_SurfaceTemp']))
-            # mask the image
-            .updateMask(dswe1a) # dswe1 with algal mask
-            # add bands for summaries
-            .addBands(gt0) 
-            .addBands(dswe1)
-            .addBands(dswe3)
-            .addBands(dswe1a)
-            .addBands(high_opac)
-            .addBands(unreal_val)
-            .addBands(sun_glint)
-            .addBands(ir_glint_water)
-            .addBands(blue_zero)
-            .addBands(blue_thresh)
-            .addBands(green_zero)
-            .addBands(green_thresh)
-            .addBands(red_zero)
-            .addBands(red_thresh)
-            .addBands(nir_zero)
-            .addBands(nir_thresh)
-            .addBands(swir1_zero)
-            .addBands(swir1_thresh)
-            .addBands(swir2_zero)
-            .addBands(swir2_thresh)
-            .addBands(blue_glint)
-            .addBands(green_glint)
-            .addBands(red_glint)
-            .addBands(nir_glint)
-            .addBands(swir1_glint)
-            .addBands(swir2_glint)
-            .addBands(nir_ir_glint)
-            .addBands(swir1_ir_glint)
-            .addBands(swir2_ir_glint)
-            .addBands(clouds) 
-            .addBands(hs.eq(0).rename('hillShadow')) # invert so prop_hillShadow = proportion shaded
-            .addBands(h)
-            ) 
-  combinedReducer = (ee.Reducer.median().unweighted()
-      .forEachBand(pixOut.select(['med_Blue', 'med_Green', 'med_Red', 
-            'med_Nir', 'med_Swir1', 'med_Swir2', 'med_SurfaceTemp']))
-    .combine(ee.Reducer.min().unweighted()
-      .forEachBand(pixOut.select(['min_SurfaceTemp'])), sharedInputs = False)
-    .combine(ee.Reducer.stdDev().unweighted()
-      .forEachBand(pixOut.select(['sd_Blue', 'sd_Green', 'sd_Red', 'sd_Nir', 'sd_Swir1', 'sd_Swir2', 'sd_SurfaceTemp'])), 
-      sharedInputs = False)
-    .combine(ee.Reducer.mean().unweighted()
-      .forEachBand(pixOut.select(['mean_Blue', 'mean_Green', 'mean_Red', 
-              'mean_Nir', 'mean_Swir1', 'mean_Swir2', 'mean_SurfaceTemp'])), sharedInputs = False)
-    .combine(ee.Reducer.count().unweighted()
-      .forEachBand(pixOut.select(['dswe_gt0', 'dswe1', 'dswe3', 'dswe1a', 
-              'high_opac', 'unreal_val',
-              'sun_glint', 'ir_glint',
-              'blue_zero', 'blue_thresh', 'green_zero', 'green_thresh', 'red_zero', 'red_thresh',
-              'nir_zero', 'nir_thresh', 'swir1_zero', 'swir1_thresh', 'swir2_zero', 'swir2_thresh',
-              'blue_glint', 'green_glint', 'red_glint', 'nir_glint', 'swir1_glint', 'swir2_glint',
-              'nir_ir_glint', 'swir1_ir_glint', 'swir2_ir_glint'])), 
-      outputPrefix = 'pCount_', sharedInputs = False)
-    .combine(ee.Reducer.mean().unweighted()
-      .forEachBand(pixOut.select(['clouds', 'hillShadow'])), 
-      outputPrefix = 'prop_', sharedInputs = False)
-    .combine(ee.Reducer.mean().unweighted()
-      .forEachBand(pixOut.select(['hillShade'])), 
-      outputPrefix = 'mean_', sharedInputs = False)
-    )
-  # Collect median reflectance and occurance values
-  # Make a cloud score, and get the water pixel count
-  lsout = (pixOut.reduceRegions(feat, combinedReducer, 30))
-  out = lsout.map(remove_geo)
-  return out
-
-def ref_pull_457_DSWE3(image, feat):
-  """ This function applies all functions to the Landsat 4-7 ee.ImageCollection, extracting
-  summary statistics for each geometry area where the DSWE value is 3 (high confidence
-  vegetated pixel)
-
-  Args:
-      image: ee.Image of an ee.ImageCollection
-      feat: ee.FeatureGeometry of the buffered locations
-
-  Returns:
-      summaries for band data within any given geometry area where the DSWE value is 3
-  """
-  # process image with cfmask
-  # where the mask is >= 1 (dilated cloud, cloud, cloud shadow, snow)
-  # call that 1 (otherwise 0) and rename as clouds.
-  clouds = add_cf_mask(image).select('cfmask').gte(1).rename('clouds')
-  # add mask FOR low opacity, realistic values, sun glint, ir glint
-  opac = add_opac_mask(image).select('opac').eq(1).rename('low_opac')
-  real = add_realistic_mask(image).select('real').eq(1).rename('is_real')
-  no_glint = add_sun_glint_mask(image).select('no_glint').eq(1)
-  ir_glint = add_ir_glint_flag(image).select('ir_glint').eq(1)
-  #calculate hillshade
-  h = calc_hill_shades(image, wrs.geometry()).select('hillShade')
-  #calculate hillshadow
-  hs = calc_hill_shadows(image, wrs.geometry()).select('hillShadow')
-  #apply dswe function
-  d = DSWE(image).select('dswe')
-  
-    # create additive masks for dswe>0 (water of any type)
-  # hs = 1, fully illuminated pixels
-  gt0 = (d.gt(0).rename('dswe_gt0')
-    .updateMask(hs.eq(1))
-    # add cloud, opac and real
-    .updateMask(clouds.eq(0))
-    .updateMask(opac.eq(1))
-    .updateMask(real.eq(1))
-    .updateMask(no_glint.eq(1))
-    .selfMask()
-    )
-    
-  # create additive masks for dswe==1 (confident open water)
-  # hs = 1, fully illuminated pixels
-  dswe1 = (d.eq(1).rename('dswe1')
-    .updateMask(hs.eq(1))
-    # add cloud, opac and real
-    .updateMask(clouds.eq(0))
-    .updateMask(opac.eq(1))
-    .updateMask(real.eq(1))
-    .updateMask(no_glint.eq(1))
-    .selfMask()
-    )
-    
-  # create additive masks for dswe==3 (confident vegetated water)
-  # hs = 1, fully illuminated pixels
-  dswe3 = (d.eq(3).rename('dswe3')
-    .updateMask(hs.eq(1))
-    # add cloud, opac and real
-    .updateMask(clouds.eq(0))
-    .updateMask(opac.eq(1))
-    .updateMask(real.eq(1))
-    .updateMask(no_glint.eq(1))
-    .selfMask()
-    )
-    
-  # define algae where DSWE > 1 and red/green threshold met
-  grn_alg_thrsh = image.select('Green').gt(0.05)
-  red_alg_thrsh = image.select('Red').lt(0.04)
-  alg = (d.gt(1).rename('algae')
-    .And(grn_alg_thrsh.eq(1))
-    .And(red_alg_thrsh.eq(1))
-    # add cloud, opac and real
-    .updateMask(clouds.eq(0))
-    .updateMask(opac.eq(1))
-    .updateMask(real.eq(1))
-    .updateMask(no_glint.eq(1))
-    )
-    
-  # create additive mask for dswe1a: dswe = 1 or algal threshold met
-  # hs = 1, fully illuminated pixels
-  dswe1a = (d.eq(1)
-    .Or(alg.eq(1))
-    .rename('dswe1a')
-    .updateMask(hs.eq(1))
-    # add cloud, opac and real
-    .updateMask(clouds.eq(0))
-    .updateMask(opac.eq(1))
-    .updateMask(real.eq(1))
-    .updateMask(no_glint.eq(1))
-    .selfMask()
-    )
-  
-  # create masks for each band for <0 and <-0.01
-  blue_zero = image.select('Blue').lt(0).rename('blue_zero').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(d.eq(3)).selfMask()
-  blue_thresh = image.select('Blue').lt(-0.01).rename('blue_thresh').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(d.eq(3)).selfMask()
-  green_zero = image.select('Green').lt(0).rename('green_zero').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(d.eq(3)).selfMask()
-  green_thresh = image.select('Green').lt(-0.01).rename('green_thresh').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(d.eq(3)).selfMask()
-  red_zero = image.select('Red').lt(0).rename('red_zero').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(d.eq(3)).selfMask()
-  red_thresh = image.select('Red').lt(-0.01).rename('red_thresh').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(d.eq(3)).selfMask()
-  nir_zero = image.select('Nir').lt(0).rename('nir_zero').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(d.eq(3)).selfMask()
-  nir_thresh = image.select('Nir').lt(-0.01).rename('nir_thresh').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(d.eq(3)).selfMask()
-  swir1_zero = image.select('Swir1').lt(0).rename('swir1_zero').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(d.eq(3)).selfMask()
-  swir1_thresh = image.select('Swir1').lt(-0.01).rename('swir1_thresh').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(d.eq(3)).selfMask()
-  swir2_zero = image.select('Swir2').lt(0).rename('swir2_zero').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(d.eq(3)).selfMask()
-  swir2_thresh = image.select('Swir2').lt(-0.01).rename('swir2_thresh').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(d.eq(3)).selfMask()
-
-  # create masks for each band for >=0.2
-  blue_glint = image.select('Blue').gte(0.2).rename('blue_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(d.eq(3)).selfMask()
-  green_glint = image.select('Green').gte(0.2).rename('green_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(d.eq(3)).selfMask()
-  red_glint = image.select('Red').gte(0.2).rename('red_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(d.eq(3)).selfMask()
-  nir_glint = image.select('Nir').gte(0.2).rename('nir_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(d.eq(3)).selfMask()
-  swir1_glint = image.select('Swir1').gte(0.2).rename('swir1_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(d.eq(3)).selfMask()
-  swir2_glint = image.select('Swir2').gte(0.2).rename('swir2_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(d.eq(3)).selfMask()
-
-  # create masks for ir bands >=0.1
-  nir_ir_glint = image.select('Nir').gte(0.1).rename('nir_ir_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(d.eq(3)).selfMask()
-  swir1_ir_glint = image.select('Swir1').gte(0.1).rename('swir1_ir_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(d.eq(3)).selfMask()
-  swir2_ir_glint = image.select('Swir2').gte(0.1).rename('swir2_ir_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(d.eq(3)).selfMask()
-    
-  # count pixels within the water area that fail the realistic value or sun
-  # glint masks, or are flagged for ir glint (hillshadow, cloud and opacity masks applied)
-  unreal_val = real.eq(0).rename('unreal_val').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(d.eq(3)).selfMask()
-  sun_glint = no_glint.eq(0).rename('sun_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(d.eq(3)).selfMask()
-  ir_glint_water = ir_glint.rename('ir_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(opac.eq(1)).updateMask(d.eq(3)).selfMask()
-  # count pixels within the water area that fail the opacity mask (hillshadow
-  # and cloud masks applied)
-  high_opac = opac.eq(0).rename('high_opac').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(d.eq(3)).selfMask()
-
-  pixOut = (image.select(['Blue', 'Green', 'Red', 'Nir', 'Swir1', 'Swir2',
-                      'SurfaceTemp'],
-                      ['med_Blue', 'med_Green', 'med_Red', 'med_Nir', 'med_Swir1', 'med_Swir2',
-                      'med_SurfaceTemp'])
-          .addBands(image.select(['SurfaceTemp'],
-                                  ['min_SurfaceTemp']))
-          .addBands(image.select(['Blue', 'Green', 'Red',
-                                  'Nir', 'Swir1', 'Swir2', 'SurfaceTemp'],
-                                ['sd_Blue', 'sd_Green', 'sd_Red',
-                                'sd_Nir', 'sd_Swir1', 'sd_Swir2', 'sd_SurfaceTemp']))
-          .addBands(image.select(['Blue', 'Green', 'Red', 'Nir',
-                                  'Swir1', 'Swir2',
-                                  'SurfaceTemp'],
-                                ['mean_Blue', 'mean_Green', 'mean_Red', 'mean_Nir',
-                                'mean_Swir1', 'mean_Swir2',
-                                'mean_SurfaceTemp']))
-          # mask the image
-          .updateMask(dswe3) # vegetated water mask
-          # add bands for summaries
-          .addBands(gt0) 
-          .addBands(dswe1)
-          .addBands(dswe3)
-          .addBands(dswe1a)
-          .addBands(high_opac)
-          .addBands(unreal_val)
-          .addBands(sun_glint)
-          .addBands(ir_glint_water)
-          .addBands(blue_zero)
-          .addBands(blue_thresh)
-          .addBands(green_zero)
-          .addBands(green_thresh)
-          .addBands(red_zero)
-          .addBands(red_thresh)
-          .addBands(nir_zero)
-          .addBands(nir_thresh)
-          .addBands(swir1_zero)
-          .addBands(swir1_thresh)
-          .addBands(swir2_zero)
-          .addBands(swir2_thresh)
-          .addBands(blue_glint)
-          .addBands(green_glint)
-          .addBands(red_glint)
-          .addBands(nir_glint)
-          .addBands(swir1_glint)
-          .addBands(swir2_glint)
-          .addBands(nir_ir_glint)
-          .addBands(swir1_ir_glint)
-          .addBands(swir2_ir_glint)
-          .addBands(clouds) 
-          .addBands(hs.eq(0).rename('hillShadow')) # invert so prop_hillShadow = proportion shaded
-          .addBands(h)
-          ) 
-  combinedReducer = (ee.Reducer.median().unweighted()
-      .forEachBand(pixOut.select(['med_Blue', 'med_Green', 'med_Red', 
-            'med_Nir', 'med_Swir1', 'med_Swir2', 'med_SurfaceTemp']))
-    .combine(ee.Reducer.min().unweighted()
-      .forEachBand(pixOut.select(['min_SurfaceTemp'])), sharedInputs = False)
-    .combine(ee.Reducer.stdDev().unweighted()
-      .forEachBand(pixOut.select(['sd_Blue', 'sd_Green', 'sd_Red', 'sd_Nir', 'sd_Swir1', 'sd_Swir2', 'sd_SurfaceTemp'])), 
-      sharedInputs = False)
-    .combine(ee.Reducer.mean().unweighted()
-      .forEachBand(pixOut.select(['mean_Blue', 'mean_Green', 'mean_Red', 
-              'mean_Nir', 'mean_Swir1', 'mean_Swir2', 'mean_SurfaceTemp'])), sharedInputs = False)
-    .combine(ee.Reducer.count().unweighted()
-      .forEachBand(pixOut.select(['dswe_gt0', 'dswe1', 'dswe3', 'dswe1a', 
-              'high_opac', 'unreal_val',
-              'sun_glint', 'ir_glint',
-              'blue_zero', 'blue_thresh', 'green_zero', 'green_thresh', 'red_zero', 'red_thresh',
-              'nir_zero', 'nir_thresh', 'swir1_zero', 'swir1_thresh', 'swir2_zero', 'swir2_thresh',
-              'blue_glint', 'green_glint', 'red_glint', 'nir_glint', 'swir1_glint', 'swir2_glint',
-              'nir_ir_glint', 'swir1_ir_glint', 'swir2_ir_glint'])), 
-      outputPrefix = 'pCount_', sharedInputs = False)
-    .combine(ee.Reducer.mean().unweighted()
-      .forEachBand(pixOut.select(['clouds', 'hillShadow'])), 
-      outputPrefix = 'prop_', sharedInputs = False)
-    .combine(ee.Reducer.mean().unweighted()
-      .forEachBand(pixOut.select(['hillShade'])), 
-      outputPrefix = 'mean_', sharedInputs = False)
-    )
-  # Collect median reflectance and occurance values
-  # Make a cloud score, and get the water pixel count
-  lsout = (pixOut.reduceRegions(feat, combinedReducer, 30))
-  out = lsout.map(remove_geo)
-  return out
-
-
-def ref_pull_89_DSWE1(image, feat):
-  """ This function applies all functions to the Landsat 8 and 9 ee.ImageCollection, extracting
-  summary statistics for each geometry area where DSWE is 1, high confidence water
-
-  Args:
-      image: ee.Image of an ee.ImageCollection
-      feat: ee.FeatureGeometry of the buffered locations
-
-  Returns:
-      summaries for band data within any given geometry area where the DSWE is 1
-  """
-  # where the cfmask is >= 1 (dilated cloud, cloud, cloud shadow, snow), call that 1 (otherwise 0) and rename as clouds.
-  clouds = add_cf_mask(image).select('cfmask').gte(1).rename('clouds')
-  # add mask FOR low aerosol, realistic values, sun glint, ir glint
-  aero = add_sr_aero_mask(image).select('aero').eq(1).rename('low_aero')
-  real = add_realistic_mask(image).select('real').eq(1).rename('is_real')
-  no_glint = add_sun_glint_mask(image).select('no_glint').eq(1)
-  ir_glint = add_ir_glint_flag(image).select('ir_glint').eq(1)
-  # calculate hillshade
-  h = calc_hill_shades(image, wrs.geometry()).select('hillShade')
-  # calculate hillshadow
-  hs = calc_hill_shadows(image, wrs.geometry()).select('hillShadow')
-  # calculage DSWE
-  d = DSWE(image).select('dswe')
-  
-  # create additive masks for dswe>0 (water of any type)
-  # hs = 1, fully illuminated pixels
-  gt0 = (d.gt(0).rename('dswe_gt0')
-    .updateMask(hs.eq(1))
-    # add cloud, aero and real
-    .updateMask(clouds.eq(0))
-    .updateMask(aero.eq(1))
-    .updateMask(real.eq(1))
-    .updateMask(no_glint.eq(1))
-    .selfMask()
-    )
-    
-  # create additive masks for dswe==1 (confident open water)
-  # hs = 1, fully illuminated pixels
-  dswe1 = (d.eq(1).rename('dswe1')
-    .updateMask(hs.eq(1))
-    # add cloud, aero and real
-    .updateMask(clouds.eq(0))
-    .updateMask(aero.eq(1))
-    .updateMask(real.eq(1))
-    .updateMask(no_glint.eq(1))
-    .selfMask()
-    )
-    
-  # create additive masks for dswe==3 (confident vegetated water)
-  # hs = 1, fully illuminated pixels
-  dswe3 = (d.eq(3).rename('dswe3')
-    .updateMask(hs.eq(1))
-    # add cloud, aero and real
-    .updateMask(clouds.eq(0))
-    .updateMask(aero.eq(1))
-    .updateMask(real.eq(1))
-    .updateMask(no_glint.eq(1))
-    .selfMask()
-    )
-    
-  # define algae where DSWE > 1 and red/green threshold met
-  grn_alg_thrsh = image.select('Green').gt(0.05)
-  red_alg_thrsh = image.select('Red').lt(0.04)
-  alg = (d.gt(1).rename('algae')
-    .And(grn_alg_thrsh.eq(1))
-    .And(red_alg_thrsh.eq(1))
-    # add cloud, aero and real
-    .updateMask(clouds.eq(0))
-    .updateMask(aero.eq(1))
-    .updateMask(real.eq(1))
-    .updateMask(no_glint.eq(1))
-    )
-    
-  # create additive mask for dswe1a: dswe = 1 or algal threshold met
-  # hs = 1, fully illuminated pixels
-  dswe1a = (d.eq(1)
-    .Or(alg.eq(1))
-    .rename('dswe1a')
-    .updateMask(hs.eq(1))
-    # add cloud, aero and real
-    .updateMask(clouds.eq(0))
-    .updateMask(aero.eq(1))
-    .updateMask(real.eq(1))
-    .updateMask(no_glint.eq(1))
-    .selfMask()
-    )
-    
-  # create masks for each band for <0 and <-0.01
-  aero_zero = image.select('Aerosol').lt(0).rename('aero_zero').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(d.eq(1)).selfMask()
-  aero_thresh = image.select('Aerosol').lt(-0.01).rename('aero_thresh').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(d.eq(1)).selfMask()
-  blue_zero = image.select('Blue').lt(0).rename('blue_zero').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(d.eq(1)).selfMask()
-  blue_thresh = image.select('Blue').lt(-0.01).rename('blue_thresh').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(d.eq(1)).selfMask()
-  green_zero = image.select('Green').lt(0).rename('green_zero').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(d.eq(1)).selfMask()
-  green_thresh = image.select('Green').lt(-0.01).rename('green_thresh').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(d.eq(1)).selfMask()
-  red_zero = image.select('Red').lt(0).rename('red_zero').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(d.eq(1)).selfMask()
-  red_thresh = image.select('Red').lt(-0.01).rename('red_thresh').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(d.eq(1)).selfMask()
-  nir_zero = image.select('Nir').lt(0).rename('nir_zero').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(d.eq(1)).selfMask()
-  nir_thresh = image.select('Nir').lt(-0.01).rename('nir_thresh').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(d.eq(1)).selfMask()
-  swir1_zero = image.select('Swir1').lt(0).rename('swir1_zero').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(d.eq(1)).selfMask()
-  swir1_thresh = image.select('Swir1').lt(-0.01).rename('swir1_thresh').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(d.eq(1)).selfMask()
-  swir2_zero = image.select('Swir2').lt(0).rename('swir2_zero').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(d.eq(1)).selfMask()
-  swir2_thresh = image.select('Swir2').lt(-0.01).rename('swir2_thresh').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(d.eq(1)).selfMask()
-
-  # create masks for each band for >=0.2
-  blue_glint = image.select('Blue').gte(0.2).rename('blue_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(d.eq(1)).selfMask()
-  green_glint = image.select('Green').gte(0.2).rename('green_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(d.eq(1)).selfMask()
-  red_glint = image.select('Red').gte(0.2).rename('red_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(d.eq(1)).selfMask()
-  nir_glint = image.select('Nir').gte(0.2).rename('nir_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(d.eq(1)).selfMask()
-  swir1_glint = image.select('Swir1').gte(0.2).rename('swir1_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(d.eq(1)).selfMask()
-  swir2_glint = image.select('Swir2').gte(0.2).rename('swir2_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(d.eq(1)).selfMask()
-
-  # create masks for ir bands >=0.1
-  nir_ir_glint = image.select('Nir').gte(0.1).rename('nir_ir_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(d.eq(1)).selfMask()
-  swir1_ir_glint = image.select('Swir1').gte(0.1).rename('swir1_ir_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(d.eq(1)).selfMask()
-  swir2_ir_glint = image.select('Swir2').gte(0.1).rename('swir2_ir_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(d.eq(1)).selfMask()
-
-  # count pixels within the water area that fail the realistic value or sun
-  # glint masks, or are flagged for ir glint (hillshadow, cloud and aerosol masks applied)
-  unreal_val = real.eq(0).rename('unreal_val').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(d.eq(1)).selfMask()
-  sun_glint = no_glint.eq(0).rename('sun_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(d.eq(1)).selfMask()
-  ir_glint_water = ir_glint.rename('ir_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(d.eq(1)).selfMask()
-  # count pixels within the water area that fail the aerosol mask (hillshadow
-  # and cloud masks applied)
-  high_aero = aero.eq(0).rename('high_aero').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(d.eq(1)).selfMask()
-
-  pixOut = (image.select(['Aerosol', 'Blue', 'Green', 'Red', 'Nir', 'Swir1', 'Swir2', 
-                      'SurfaceTemp'],
-                      ['med_Aerosol', 'med_Blue', 'med_Green', 'med_Red', 'med_Nir', 'med_Swir1', 'med_Swir2', 
-                      'med_SurfaceTemp'])
-          .addBands(image.select(['SurfaceTemp'],
-                                  ['min_SurfaceTemp']))
-          .addBands(image.select(['Aerosol', 'Blue', 'Green', 'Red', 
-                                  'Nir', 'Swir1', 'Swir2', 'SurfaceTemp'],
-                                ['sd_Aerosol', 'sd_Blue', 'sd_Green', 'sd_Red', 
-                                'sd_Nir', 'sd_Swir1', 'sd_Swir2', 'sd_SurfaceTemp']))
-          .addBands(image.select(['Aerosol', 'Blue', 'Green', 'Red', 'Nir', 
-                                  'Swir1', 'Swir2', 
-                                  'SurfaceTemp'],
-                                ['mean_Aerosol', 'mean_Blue', 'mean_Green', 'mean_Red', 'mean_Nir', 
-                                'mean_Swir1', 'mean_Swir2', 
-                                'mean_SurfaceTemp']))
-          # mask the image
-          .updateMask(dswe1) # high confidence water mask
-          # add bands back in for QA (prior to masking of dswe/hs/f/r)
-          .addBands(gt0) 
-          .addBands(dswe1)
-          .addBands(dswe3)
-          .addBands(dswe1a)
-          .addBands(high_aero)
-          .addBands(unreal_val)
-          .addBands(sun_glint)
-          .addBands(ir_glint_water)
-          .addBands(aero_zero)
-          .addBands(aero_thresh)
-          .addBands(blue_zero)
-          .addBands(blue_thresh)
-          .addBands(green_zero)
-          .addBands(green_thresh)
-          .addBands(red_zero)
-          .addBands(red_thresh)
-          .addBands(nir_zero)
-          .addBands(nir_thresh)
-          .addBands(swir1_zero)
-          .addBands(swir1_thresh)
-          .addBands(swir2_zero)
-          .addBands(swir2_thresh)
-          .addBands(blue_glint)
-          .addBands(green_glint)
-          .addBands(red_glint)
-          .addBands(nir_glint)
-          .addBands(swir1_glint)
-          .addBands(swir2_glint)
-          .addBands(nir_ir_glint)
-          .addBands(swir1_ir_glint)
-          .addBands(swir2_ir_glint)
-          .addBands(clouds) 
-          .addBands(hs.eq(0).rename('hillShadow')) # invert so prop_hillShadow = proportion shaded
-          .addBands(h)
-          ) 
-  
-  combinedReducer = (ee.Reducer.median().unweighted()
-      .forEachBand(pixOut.select(['med_Aerosol', 'med_Blue', 'med_Green', 'med_Red', 
-            'med_Nir', 'med_Swir1', 'med_Swir2', 'med_SurfaceTemp']))
-    .combine(ee.Reducer.min().unweighted()
-      .forEachBand(pixOut.select(['min_SurfaceTemp'])), sharedInputs = False)
-    .combine(ee.Reducer.stdDev().unweighted()
-      .forEachBand(pixOut.select(['sd_Aerosol', 'sd_Blue', 'sd_Green', 'sd_Red', 'sd_Nir', 'sd_Swir1', 'sd_Swir2', 'sd_SurfaceTemp'])), 
-      sharedInputs = False)
-    .combine(ee.Reducer.mean().unweighted()
-      .forEachBand(pixOut.select(['mean_Aerosol', 'mean_Blue', 'mean_Green', 'mean_Red', 
-              'mean_Nir', 'mean_Swir1', 'mean_Swir2', 'mean_SurfaceTemp'])), sharedInputs = False)
-    .combine(ee.Reducer.count().unweighted()
-      .forEachBand(pixOut.select(['dswe_gt0', 'dswe1', 'dswe3', 'dswe1a', 'high_aero', 'unreal_val',
-              'sun_glint', 'ir_glint', 'aero_zero', 'aero_thresh',
-              'blue_zero', 'blue_thresh', 'green_zero', 'green_thresh', 'red_zero', 'red_thresh',
-              'nir_zero', 'nir_thresh', 'swir1_zero', 'swir1_thresh', 'swir2_zero', 'swir2_thresh',
-              'blue_glint', 'green_glint', 'red_glint', 'nir_glint', 'swir1_glint', 'swir2_glint',
-              'nir_ir_glint', 'swir1_ir_glint', 'swir2_ir_glint'])), 
-      outputPrefix = 'pCount_', sharedInputs = False)
-    .combine(ee.Reducer.mean().unweighted()
-      .forEachBand(pixOut.select(['clouds', 'hillShadow'])), 
-      outputPrefix = 'prop_', sharedInputs = False)
-    .combine(ee.Reducer.mean().unweighted()
-      .forEachBand(pixOut.select(['hillShade'])), 
-      outputPrefix = 'mean_', sharedInputs = False)
-    )
-  
-  lsout = (pixOut.reduceRegions(feat, combinedReducer, 30))
-  out = lsout.map(remove_geo)
-  return out
-
-
-def ref_pull_89_DSWE1a(image, feat):
-  """ This function applies all functions to the Landsat 8 and 9 ee.ImageCollection, extracting
-  summary statistics for each geometry area where the DSWE value is 1 (high confidence water)
-  or the algal threshold has been met
-
-  Args:
-      image: ee.Image of an ee.ImageCollection
-      feat: ee.FeatureGeometry of the buffered locations
-
-  Returns:
-      summaries for band data within any given geometry area where the DSWE value is 1 or the algal
-      threshold has been met
-  """
-  # where the cfmask is >= 1 (dilated cloud, cloud, cloud shadow, snow), call that 1 (otherwise 0) and rename as clouds.
-  clouds = add_cf_mask(image).select('cfmask').gte(1).rename('clouds')
-  # add mask FOR low aerosol, realistic values, sun glint, ir glint
-  aero = add_sr_aero_mask(image).select('aero').eq(1).rename('low_aero')
-  real = add_realistic_mask(image).select('real').eq(1).rename('is_real')
-  no_glint = add_sun_glint_mask(image).select('no_glint').eq(1)
-  ir_glint = add_ir_glint_flag(image).select('ir_glint').eq(1)
-  #calculate hillshade
-  h = calc_hill_shades(image, wrs.geometry()).select('hillShade')
-  #calculate hillshadow
-  hs = calc_hill_shadows(image, wrs.geometry()).select('hillShadow')
-  # calculage DSWE
-  d = DSWE(image).select('dswe')
-  
-  # create additive masks for dswe>0 (water of any type)
-  # hs = 1, fully illuminated pixels
-  gt0 = (d.gt(0).rename('dswe_gt0')
-    .updateMask(hs.eq(1))
-    # add cloud, aero and real
-    .updateMask(clouds.eq(0))
-    .updateMask(aero.eq(1))
-    .updateMask(real.eq(1))
-    .updateMask(no_glint.eq(1))
-    .selfMask()
-    )
-    
-  # create additive masks for dswe==1 (confident open water)
-  # hs = 1, fully illuminated pixels
-  dswe1 = (d.eq(1).rename('dswe1')
-    .updateMask(hs.eq(1))
-    # add cloud, aero and real
-    .updateMask(clouds.eq(0))
-    .updateMask(aero.eq(1))
-    .updateMask(real.eq(1))
-    .updateMask(no_glint.eq(1))
-    .selfMask()
-    )
-    
-  # create additive masks for dswe==3 (confident vegetated water)
-  # hs = 1, fully illuminated pixels
-  dswe3 = (d.eq(3).rename('dswe3')
-    .updateMask(hs.eq(1))
-    # add cloud, aero and real
-    .updateMask(clouds.eq(0))
-    .updateMask(aero.eq(1))
-    .updateMask(real.eq(1))
-    .updateMask(no_glint.eq(1))
-    .selfMask()
-    )
-  
-  # define algae where DSWE > 1 and red/green threshold met
-  grn_alg_thrsh = image.select('Green').gt(0.05)
-  red_alg_thrsh = image.select('Red').lt(0.04)
-  alg = (d.gt(1).rename('algae')
-    .And(grn_alg_thrsh.eq(1))
-    .And(red_alg_thrsh.eq(1))
-    # add cloud, aero and real
-    .updateMask(clouds.eq(0))
-    .updateMask(aero.eq(1))
-    .updateMask(real.eq(1))
-    .updateMask(no_glint.eq(1))
-    )
-    
-  # create additive mask for dswe1a: dswe = 1 or algal threshold met
-  # hs = 1, fully illuminated pixels
-  dswe1a = (d.eq(1)
-    .Or(alg.eq(1))
-    .rename('dswe1a')
-    .updateMask(hs.eq(1))
-    # add cloud, aero and real
-    .updateMask(clouds.eq(0))
-    .updateMask(aero.eq(1))
-    .updateMask(real.eq(1))
-    .updateMask(no_glint.eq(1))
-    .selfMask()
-    )
-  
-  # DSWE1a water area for the diagnostic counts below. This uses the algal
-  # thresholds directly rather than 'alg', because 'alg' has the realistic
-  # value and sun glint masks applied and would hide the pixels being counted
-  water_1a = d.eq(1).Or(d.gt(1).And(grn_alg_thrsh.eq(1)).And(red_alg_thrsh.eq(1)))
-
-  # create masks for each band for <0 and <-0.01
-  aero_zero = image.select('Aerosol').lt(0).rename('aero_zero').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(water_1a).selfMask()
-  aero_thresh = image.select('Aerosol').lt(-0.01).rename('aero_thresh').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(water_1a).selfMask()
-  blue_zero = image.select('Blue').lt(0).rename('blue_zero').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(water_1a).selfMask()
-  blue_thresh = image.select('Blue').lt(-0.01).rename('blue_thresh').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(water_1a).selfMask()
-  green_zero = image.select('Green').lt(0).rename('green_zero').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(water_1a).selfMask()
-  green_thresh = image.select('Green').lt(-0.01).rename('green_thresh').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(water_1a).selfMask()
-  red_zero = image.select('Red').lt(0).rename('red_zero').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(water_1a).selfMask()
-  red_thresh = image.select('Red').lt(-0.01).rename('red_thresh').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(water_1a).selfMask()
-  nir_zero = image.select('Nir').lt(0).rename('nir_zero').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(water_1a).selfMask()
-  nir_thresh = image.select('Nir').lt(-0.01).rename('nir_thresh').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(water_1a).selfMask()
-  swir1_zero = image.select('Swir1').lt(0).rename('swir1_zero').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(water_1a).selfMask()
-  swir1_thresh = image.select('Swir1').lt(-0.01).rename('swir1_thresh').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(water_1a).selfMask()
-  swir2_zero = image.select('Swir2').lt(0).rename('swir2_zero').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(water_1a).selfMask()
-  swir2_thresh = image.select('Swir2').lt(-0.01).rename('swir2_thresh').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(water_1a).selfMask()
-  
-  # create masks for each band for >=0.2
-  blue_glint = image.select('Blue').gte(0.2).rename('blue_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(water_1a).selfMask()
-  green_glint = image.select('Green').gte(0.2).rename('green_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(water_1a).selfMask()
-  red_glint = image.select('Red').gte(0.2).rename('red_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(water_1a).selfMask()
-  nir_glint = image.select('Nir').gte(0.2).rename('nir_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(water_1a).selfMask()
-  swir1_glint = image.select('Swir1').gte(0.2).rename('swir1_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(water_1a).selfMask()
-  swir2_glint = image.select('Swir2').gte(0.2).rename('swir2_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(water_1a).selfMask()
-
-  # create masks for ir bands >=0.1
-  nir_ir_glint = image.select('Nir').gte(0.1).rename('nir_ir_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(water_1a).selfMask()
-  swir1_ir_glint = image.select('Swir1').gte(0.1).rename('swir1_ir_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(water_1a).selfMask()
-  swir2_ir_glint = image.select('Swir2').gte(0.1).rename('swir2_ir_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(water_1a).selfMask()
-  
-  # count pixels within the water area that fail the realistic value or sun
-  # glint masks, or are flagged for ir glint (hillshadow, cloud and aerosol masks applied)
-  unreal_val = real.eq(0).rename('unreal_val').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(water_1a).selfMask()
-  sun_glint = no_glint.eq(0).rename('sun_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(water_1a).selfMask()
-  ir_glint_water = ir_glint.rename('ir_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(water_1a).selfMask()
-  # count pixels within the water area that fail the aerosol mask (hillshadow
-  # and cloud masks applied)
-  high_aero = aero.eq(0).rename('high_aero').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(water_1a).selfMask()
-
-  pixOut = (image.select(['Aerosol', 'Blue', 'Green', 'Red', 'Nir', 'Swir1', 'Swir2',
-                      'SurfaceTemp'],
-                      ['med_Aerosol', 'med_Blue', 'med_Green', 'med_Red', 'med_Nir', 'med_Swir1', 'med_Swir2',
-                      'med_SurfaceTemp'])
-          .addBands(image.select(['SurfaceTemp'],
-                                  ['min_SurfaceTemp']))
-          .addBands(image.select(['Aerosol', 'Blue', 'Green', 'Red',
-                                  'Nir', 'Swir1', 'Swir2', 'SurfaceTemp'],
-                                ['sd_Aerosol', 'sd_Blue', 'sd_Green', 'sd_Red',
-                                'sd_Nir', 'sd_Swir1', 'sd_Swir2', 'sd_SurfaceTemp']))
-          .addBands(image.select(['Aerosol', 'Blue', 'Green', 'Red', 'Nir',
-                                  'Swir1', 'Swir2',
-                                  'SurfaceTemp'],
-                                ['mean_Aerosol', 'mean_Blue', 'mean_Green', 'mean_Red', 'mean_Nir',
-                                'mean_Swir1', 'mean_Swir2',
-                                'mean_SurfaceTemp']))
-          # mask the image
-          .updateMask(dswe1a) # high confidence water + algal mask
-          # add bands back in for QA (prior to masking of dswe/hs/f/r)
-          .addBands(gt0) 
-          .addBands(dswe1)
-          .addBands(dswe3)
-          .addBands(dswe1a)
-          .addBands(high_aero)
-          .addBands(unreal_val)
-          .addBands(sun_glint)
-          .addBands(ir_glint_water)
-          .addBands(aero_zero)
-          .addBands(aero_thresh)
-          .addBands(blue_zero)
-          .addBands(blue_thresh)
-          .addBands(green_zero)
-          .addBands(green_thresh)
-          .addBands(red_zero)
-          .addBands(red_thresh)
-          .addBands(nir_zero)
-          .addBands(nir_thresh)
-          .addBands(swir1_zero)
-          .addBands(swir1_thresh)
-          .addBands(swir2_zero)
-          .addBands(swir2_thresh)
-          .addBands(blue_glint)
-          .addBands(green_glint)
-          .addBands(red_glint)
-          .addBands(nir_glint)
-          .addBands(swir1_glint)
-          .addBands(swir2_glint)
-          .addBands(nir_ir_glint)
-          .addBands(swir1_ir_glint)
-          .addBands(swir2_ir_glint)
-          .addBands(clouds) 
-          .addBands(hs.eq(0).rename('hillShadow')) # invert so prop_hillShadow = proportion shaded
-          .addBands(h)
-          ) 
-  
-  combinedReducer = (ee.Reducer.median().unweighted()
-      .forEachBand(pixOut.select(['med_Aerosol', 'med_Blue', 'med_Green', 'med_Red', 
-            'med_Nir', 'med_Swir1', 'med_Swir2', 'med_SurfaceTemp']))
-    .combine(ee.Reducer.min().unweighted()
-      .forEachBand(pixOut.select(['min_SurfaceTemp'])), sharedInputs = False)
-    .combine(ee.Reducer.stdDev().unweighted()
-      .forEachBand(pixOut.select(['sd_Aerosol', 'sd_Blue', 'sd_Green', 'sd_Red', 'sd_Nir', 'sd_Swir1', 'sd_Swir2', 'sd_SurfaceTemp'])), 
-      sharedInputs = False)
-    .combine(ee.Reducer.mean().unweighted()
-      .forEachBand(pixOut.select(['mean_Aerosol', 'mean_Blue', 'mean_Green', 'mean_Red', 
-              'mean_Nir', 'mean_Swir1', 'mean_Swir2', 'mean_SurfaceTemp'])), sharedInputs = False)
-    .combine(ee.Reducer.count().unweighted()
-      .forEachBand(pixOut.select(['dswe_gt0', 'dswe1', 'dswe3', 'dswe1a', 'high_aero', 'unreal_val',
-              'sun_glint', 'ir_glint', 'aero_zero', 'aero_thresh',
-              'blue_zero', 'blue_thresh', 'green_zero', 'green_thresh', 'red_zero', 'red_thresh',
-              'nir_zero', 'nir_thresh', 'swir1_zero', 'swir1_thresh', 'swir2_zero', 'swir2_thresh',
-              'blue_glint', 'green_glint', 'red_glint', 'nir_glint', 'swir1_glint', 'swir2_glint',
-              'nir_ir_glint', 'swir1_ir_glint', 'swir2_ir_glint'])), 
-      outputPrefix = 'pCount_', sharedInputs = False)
-    .combine(ee.Reducer.mean().unweighted()
-      .forEachBand(pixOut.select(['clouds', 'hillShadow'])), 
-      outputPrefix = 'prop_', sharedInputs = False)
-    .combine(ee.Reducer.mean().unweighted()
-      .forEachBand(pixOut.select(['hillShade'])), 
-      outputPrefix = 'mean_', sharedInputs = False)
-    )
-  lsout = (pixOut.reduceRegions(feat, combinedReducer, 30))
-  out = lsout.map(remove_geo)
-  return out
-
-
-def ref_pull_89_DSWE3(image, feat):
-  """ This function applies all functions to the Landsat 8 and 9 ee.ImageCollection, extracting
-  summary statistics for each geometry area where the DSWE value is 3 (high confidence vegetated
-  pixels)
-
-  Args:
-      image: ee.Image of an ee.ImageCollection
-      feat: ee.FeatureGeometry of the buffered locations
-
-  Returns:
-      summaries for band data within any given geometry area where the DSWE value is 3
-  """
-  # where the cfmask is >= 1 (dilated cloud, cloud, cloud shadow, snow), call that 1 (otherwise 0) and rename as clouds.
-  clouds = add_cf_mask(image).select('cfmask').gte(1).rename('clouds')
-  # add mask FOR low aerosol, realistic values, sun glint, ir glint
-  aero = add_sr_aero_mask(image).select('aero').eq(1).rename('low_aero')
-  real = add_realistic_mask(image).select('real').eq(1).rename('is_real')
-  no_glint = add_sun_glint_mask(image).select('no_glint').eq(1)
-  ir_glint = add_ir_glint_flag(image).select('ir_glint').eq(1)
-  #calculate hillshade
-  h = calc_hill_shades(image, wrs.geometry()).select('hillShade')
-  #calculate hillshadow
-  hs = calc_hill_shadows(image, wrs.geometry()).select('hillShadow')
-  # calculate DSWE
-  d = DSWE(image).select('dswe')
-  
-  # create additive masks for dswe>0 (water of any type)
-  # hs = 1, fully illuminated pixels
-  gt0 = (d.gt(0).rename('dswe_gt0')
-    .updateMask(hs.eq(1))
-    # add cloud, aero and real
-    .updateMask(clouds.eq(0))
-    .updateMask(aero.eq(1))
-    .updateMask(real.eq(1))
-    .updateMask(no_glint.eq(1))
-    .selfMask()
-    )
-  # create additive masks for dswe==1 (confident open water)
-  # hs = 1, fully illuminated pixels
-  dswe1 = (d.eq(1).rename('dswe1')
-    .updateMask(hs.eq(1))
-    # add cloud, aero and real
-    .updateMask(clouds.eq(0))
-    .updateMask(aero.eq(1))
-    .updateMask(real.eq(1))
-    .updateMask(no_glint.eq(1))
-    .selfMask()
-    )
-  # create additive masks for dswe==3 (confident vegetated water)
-  # hs = 1, fully illuminated pixels
-  dswe3 = (d.eq(3).rename('dswe3')
-    .updateMask(hs.eq(1))
-    # add cloud, aero and real
-    .updateMask(clouds.eq(0))
-    .updateMask(aero.eq(1))
-    .updateMask(real.eq(1))
-    .updateMask(no_glint.eq(1))
-    .selfMask()
-    )
-  # define algae where DSWE > 1 and red/green threshold met
-  grn_alg_thrsh = image.select('Green').gt(0.05)
-  red_alg_thrsh = image.select('Red').lt(0.04)
-  alg = (d.gt(1).rename('algae')
-    .And(grn_alg_thrsh.eq(1))
-    .And(red_alg_thrsh.eq(1))
-    # add cloud, aero and real
-    .updateMask(clouds.eq(0))
-    .updateMask(aero.eq(1))
-    .updateMask(real.eq(1))
-    .updateMask(no_glint.eq(1))
-    )
-  # create additive mask for dswe1a: dswe = 1 or algal threshold met
-  # hs = 1, fully illuminated pixels
-  dswe1a = (d.eq(1)
-    .Or(alg.eq(1))
-    .rename('dswe1a')
-    .updateMask(hs.eq(1))
-    # add cloud, aero and real
-    .updateMask(clouds.eq(0))
-    .updateMask(aero.eq(1))
-    .updateMask(real.eq(1))
-    .updateMask(no_glint.eq(1))
-    .selfMask()
-    )
-  
-  # create masks for each band for <0 and <-0.01
-  aero_zero = image.select('Aerosol').lt(0).rename('aero_zero').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(d.eq(3)).selfMask()
-  aero_thresh = image.select('Aerosol').lt(-0.01).rename('aero_thresh').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(d.eq(3)).selfMask()
-  blue_zero = image.select('Blue').lt(0).rename('blue_zero').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(d.eq(3)).selfMask()
-  blue_thresh = image.select('Blue').lt(-0.01).rename('blue_thresh').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(d.eq(3)).selfMask()
-  green_zero = image.select('Green').lt(0).rename('green_zero').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(d.eq(3)).selfMask()
-  green_thresh = image.select('Green').lt(-0.01).rename('green_thresh').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(d.eq(3)).selfMask()
-  red_zero = image.select('Red').lt(0).rename('red_zero').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(d.eq(3)).selfMask()
-  red_thresh = image.select('Red').lt(-0.01).rename('red_thresh').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(d.eq(3)).selfMask()
-  nir_zero = image.select('Nir').lt(0).rename('nir_zero').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(d.eq(3)).selfMask()
-  nir_thresh = image.select('Nir').lt(-0.01).rename('nir_thresh').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(d.eq(3)).selfMask()
-  swir1_zero = image.select('Swir1').lt(0).rename('swir1_zero').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(d.eq(3)).selfMask()
-  swir1_thresh = image.select('Swir1').lt(-0.01).rename('swir1_thresh').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(d.eq(3)).selfMask()
-  swir2_zero = image.select('Swir2').lt(0).rename('swir2_zero').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(d.eq(3)).selfMask()
-  swir2_thresh = image.select('Swir2').lt(-0.01).rename('swir2_thresh').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(d.eq(3)).selfMask()
-  
-  # create masks for each band for >=0.2
-  blue_glint = image.select('Blue').gte(0.2).rename('blue_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(d.eq(3)).selfMask()
-  green_glint = image.select('Green').gte(0.2).rename('green_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(d.eq(3)).selfMask()
-  red_glint = image.select('Red').gte(0.2).rename('red_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(d.eq(3)).selfMask()
-  nir_glint = image.select('Nir').gte(0.2).rename('nir_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(d.eq(3)).selfMask()
-  swir1_glint = image.select('Swir1').gte(0.2).rename('swir1_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(d.eq(3)).selfMask()
-  swir2_glint = image.select('Swir2').gte(0.2).rename('swir2_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(d.eq(3)).selfMask()
-  
-  # create masks for ir bands >=0.1
-  nir_ir_glint = image.select('Nir').gte(0.1).rename('nir_ir_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(d.eq(3)).selfMask()
-  swir1_ir_glint = image.select('Swir1').gte(0.1).rename('swir1_ir_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(d.eq(3)).selfMask()
-  swir2_ir_glint = image.select('Swir2').gte(0.1).rename('swir2_ir_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(d.eq(3)).selfMask()  
-  
-  #calculate hillshade
-  h = calc_hill_shades(image, wrs.geometry()).select('hillShade')
-  #calculate hillshadow
-  hs = calc_hill_shadows(image, wrs.geometry()).select('hillShadow')
-  # count pixels within the water area that fail the realistic value or sun
-  # glint masks, or are flagged for ir glint (hillshadow, cloud and aerosol masks applied)
-  unreal_val = real.eq(0).rename('unreal_val').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(d.eq(3)).selfMask()
-  sun_glint = no_glint.eq(0).rename('sun_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(d.eq(3)).selfMask()
-  ir_glint_water = ir_glint.rename('ir_glint').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(aero.eq(1)).updateMask(d.eq(3)).selfMask()
-  # count pixels within the water area that fail the aerosol mask (hillshadow
-  # and cloud masks applied)
-  high_aero = aero.eq(0).rename('high_aero').updateMask(hs.eq(1)).updateMask(clouds.eq(0)).updateMask(d.eq(3)).selfMask()
-
-  pixOut = (image.select(['Aerosol', 'Blue', 'Green', 'Red', 'Nir', 'Swir1', 'Swir2',
-                      'SurfaceTemp'],
-                      ['med_Aerosol', 'med_Blue', 'med_Green', 'med_Red', 'med_Nir', 'med_Swir1', 'med_Swir2',
-                      'med_SurfaceTemp'])
-          .addBands(image.select(['SurfaceTemp'],
-                                  ['min_SurfaceTemp']))
-          .addBands(image.select(['Aerosol', 'Blue', 'Green', 'Red',
-                                  'Nir', 'Swir1', 'Swir2', 'SurfaceTemp'],
-                                ['sd_Aerosol', 'sd_Blue', 'sd_Green', 'sd_Red',
-                                'sd_Nir', 'sd_Swir1', 'sd_Swir2', 'sd_SurfaceTemp']))
-          .addBands(image.select(['Aerosol', 'Blue', 'Green', 'Red', 'Nir',
-                                  'Swir1', 'Swir2',
-                                  'SurfaceTemp'],
-                                ['mean_Aerosol', 'mean_Blue', 'mean_Green', 'mean_Red', 'mean_Nir',
-                                'mean_Swir1', 'mean_Swir2',
-                                'mean_SurfaceTemp']))
-          # mask image
-          .updateMask(dswe3) # dswe3 mask
-          # add bands back in for QA (prior to masking of dswe/hs/f/r)
-          .addBands(gt0) 
-          .addBands(dswe1)
-          .addBands(dswe3)
-          .addBands(dswe1a)
-          .addBands(high_aero)
-          .addBands(unreal_val)
-          .addBands(sun_glint)
-          .addBands(ir_glint_water)
-          .addBands(aero_zero)
-          .addBands(aero_thresh)
-          .addBands(blue_zero)
-          .addBands(blue_thresh)
-          .addBands(green_zero)
-          .addBands(green_thresh)
-          .addBands(red_zero)
-          .addBands(red_thresh)
-          .addBands(nir_zero)
-          .addBands(nir_thresh)
-          .addBands(swir1_zero)
-          .addBands(swir1_thresh)
-          .addBands(swir2_zero)
-          .addBands(swir2_thresh)
-          .addBands(blue_glint)
-          .addBands(green_glint)
-          .addBands(red_glint)
-          .addBands(nir_glint)
-          .addBands(swir1_glint)
-          .addBands(swir2_glint)
-          .addBands(nir_ir_glint)
-          .addBands(swir1_ir_glint)
-          .addBands(swir2_ir_glint)
-          .addBands(clouds) 
-          .addBands(hs.eq(0).rename('hillShadow')) # invert so prop_hillShadow = proportion shaded
-          .addBands(h)
-          ) 
-  
-  combinedReducer = (ee.Reducer.median().unweighted()
-      .forEachBand(pixOut.select(['med_Aerosol', 'med_Blue', 'med_Green', 'med_Red', 
-            'med_Nir', 'med_Swir1', 'med_Swir2', 'med_SurfaceTemp']))
-    .combine(ee.Reducer.min().unweighted()
-      .forEachBand(pixOut.select(['min_SurfaceTemp'])), sharedInputs = False)
-    .combine(ee.Reducer.stdDev().unweighted()
-      .forEachBand(pixOut.select(['sd_Aerosol', 'sd_Blue', 'sd_Green', 'sd_Red', 'sd_Nir', 'sd_Swir1', 'sd_Swir2', 'sd_SurfaceTemp'])), 
-      sharedInputs = False)
-    .combine(ee.Reducer.mean().unweighted()
-      .forEachBand(pixOut.select(['mean_Aerosol', 'mean_Blue', 'mean_Green', 'mean_Red', 
-              'mean_Nir', 'mean_Swir1', 'mean_Swir2', 'mean_SurfaceTemp'])), sharedInputs = False)
-    .combine(ee.Reducer.count().unweighted()
-      .forEachBand(pixOut.select(['dswe_gt0', 'dswe1', 'dswe3', 'dswe1a', 'high_aero', 'unreal_val',
-              'sun_glint', 'ir_glint', 'aero_zero', 'aero_thresh',
-              'blue_zero', 'blue_thresh', 'green_zero', 'green_thresh', 'red_zero', 'red_thresh',
-              'nir_zero', 'nir_thresh', 'swir1_zero', 'swir1_thresh', 'swir2_zero', 'swir2_thresh',
-              'blue_glint', 'green_glint', 'red_glint', 'nir_glint', 'swir1_glint', 'swir2_glint',
-              'nir_ir_glint', 'swir1_ir_glint', 'swir2_ir_glint'])), 
-      outputPrefix = 'pCount_', sharedInputs = False)
-    .combine(ee.Reducer.mean().unweighted()
-      .forEachBand(pixOut.select(['clouds', 'hillShadow'])), 
-      outputPrefix = 'prop_', sharedInputs = False)
-    .combine(ee.Reducer.mean().unweighted()
-      .forEachBand(pixOut.select(['hillShade'])), 
-      outputPrefix = 'mean_', sharedInputs = False)
-    )
   lsout = (pixOut.reduceRegions(feat, combinedReducer, 30))
   out = lsout.map(remove_geo)
   return out
@@ -1826,10 +782,23 @@ def maximum_no_of_tasks(MaxNActive, waitingPeriod):
 ##---- IMPORT CONFIG VARIABLES          ----##
 ##############################################
 
-# get locations and yml from data folder
-yml = read_csv("b_pull_Landsat_SRST_poi/mid/yml.csv")
+# Optional overrides, set as environment variables. These do not change the
+# config file, so they do not invalidate any {targets}. Python reads the
+# environment when it starts, so from R either use Sys.setenv() before Python is
+# initialized (i.e. before python/pySetup.R), or set them in Python directly
+# (e.g. reticulate::import("os")$environ$`__setitem__`(name, value)):
+#   LAKESR_EE_PROJ: ee project to run the tasks from, in place of ee_proj in the
+#     config (e.g. when the configured project has used its EECU quota)
+#   LAKESR_YML_CSV: formatted yml file, in place of b_pull_Landsat_SRST_poi/mid/yml.csv
+#   LAKESR_PATHROW_FILE: current path-row file, in place of
+#     b_pull_Landsat_SRST_poi/out/current_pathrow.txt
+yml_fn = os.environ.get("LAKESR_YML_CSV") or "b_pull_Landsat_SRST_poi/mid/yml.csv"
+pathrow_fn = os.environ.get("LAKESR_PATHROW_FILE") or "b_pull_Landsat_SRST_poi/out/current_pathrow.txt"
 
-eeproj = yml["ee_proj"][0]
+# get locations and yml from data folder
+yml = read_csv(yml_fn)
+
+eeproj = os.environ.get("LAKESR_EE_PROJ") or yml["ee_proj"][0]
 #initialize GEE
 ee.Initialize(project = eeproj)
 
@@ -1867,8 +836,11 @@ except AttributeError:
 extent = yml["extent"][0]
 
 # get current tile
-with open("b_pull_Landsat_SRST_poi/out/current_pathrow.txt", "r") as file:
+with open(pathrow_fn, "r") as file:
   pr = file.read()
+
+print("Using " + yml_fn + " (run_date " + str(run_date) + "), path-row " + pr +
+      ", ee project " + eeproj)
 
 # create file name of location data
 locs_fn = os.path.join("b_pull_Landsat_SRST_poi/out/locations/", ("locations_" + pr + ".csv"))
@@ -1950,291 +922,104 @@ bns89 = (["Aerosol", "Blue", "Green", "Red", "Nir", "Swir1", "Swir2",
 ##---- LANDSAT ACQUISITION          ----##
 ##########################################
 
+# get the DSWE variants to summarize from the DSWE setting. 1a also obtains
+# DSWE1 for downstream comparison
+variants = []
+if '1' in dswe:
+  variants.append('DSWE1')
+if '1a' in dswe:
+  variants.append('DSWE1a')
+if '3' in dswe:
+  variants.append('DSWE3')
+# file name label for the combined export, e.g. 'DSWEcombo1-1a'. This does not
+# match '_DSWE1_', '_DSWE1a_', or '_DSWE3_', so the combined files can not be
+# mistaken for the per-variant files during collation
+variant_label = 'DSWEcombo' + '-'.join(v.replace('DSWE', '') for v in variants)
+
+
+def send_combined_task(stack, feat, group, chunk):
+  """ Send the combined DSWE export task for one mission group and chunk
+
+  Args:
+      stack: pre-processed ee.ImageCollection for the mission group
+      feat: ee.FeatureCollection of the buffered locations
+      group: 'LS457' or 'LS89'
+      chunk: chunk number
+
+  Returns:
+      None. Starts the export task.
+  """
+  cols = get_variant_cols(group, variants)
+  locs_out = stack.map(lambda image: ref_pull_combined(image, feat, group, variants)).flatten()
+  # keep a site-scene if any variant has a summary (same as the notNull filter
+  # applied to each per-variant export)
+  locs_out = locs_out.filter(ee.Filter.Or(*[ee.Filter.notNull([v + '__med_Blue']) for v in variants]))
+  locs_srname = proj+'_site_'+group+'_C2_SRST_'+variant_label+'_'+str(pr)+'_'+str(chunk)+'_v'+run_date
+  locs_dataOut = (ee.batch.Export.table.toDrive(collection = locs_out,
+                                          description = locs_srname,
+                                          folder = folder_version,
+                                          fileFormat = 'csv',
+                                          selectors = (['system:index']
+                                            + cols['med'] + cols['min'] + cols['sd'] + cols['mean']
+                                            + ['pCount_dswe_gt0', 'pCount_dswe1', 'pCount_dswe3', 'pCount_dswe1a']
+                                            + cols['pCount']
+                                            + ['prop_clouds', 'prop_hillShadow', 'mean_hillShade'])))
+  #Send next task.
+  locs_dataOut.start()
+  print('Task sent: ' + group + ' ' + ', '.join(variants) + ' acquisitions for site configuration at tile ' + str(pr) + ' chunk ' + str(chunk + 1))
+
+
 # Map the pull function over the 5000 or so created sites, as needed
 def process_subset(df_subset, chunk, chunk_size):
   """
-  This function processes a subset of the DataFrame.
-  Replace this with your actual processing function.
+  This function processes a subset of the DataFrame, sending one combined DSWE
+  task per mission group
   """
-  
-  # Check how many existing tasks are running and take a break of 120 secs if 
+
+  # Check how many existing tasks are running and take a break of 120 secs if
   # it's more than 10, and keep checking to not overload the GEE server
   maximum_no_of_tasks(10, 120)
 
   locs_feature = csv_to_eeFeat(df_subset, yml['location_crs'][0])
-  
+
   geo = wrs.geometry()
-  
+
   ## get locs feature and buffer ##
   feat = (locs_feature
     .filterBounds(geo)
     .map(dp_buff))
-  
-  ##########################################
-  ##---- LANDSAT 457 ACQUISITION      ----##
-  ##########################################
-  
+
+  if len(variants) == 0:
+    print('Not configured to acquire any DSWE stack for site configuration')
+    return()
+
   ## pre-process 457 stack
-  #snip the ls data by the geometry of the location points    
+  #snip the ls data by the geometry of the location points
   locs_stack_ls457 = (ls457
-    .filterBounds(feat.geometry()) 
+    .filterBounds(feat.geometry())
     # apply fill mask and scaling factors
     .map(apply_fill_mask_457)
     .map(apply_scale_factors))
-  
   # rename bands for ease
   locs_stack_ls457 = locs_stack_ls457.select(bn457, bns457)
-  
   # apply masks that require above rename
   locs_stack_ls457 = (locs_stack_ls457
     .map(apply_rad_mask))
-  
-  # pull DSWE1 variations as configured
-  if '1' in dswe:
-    # pull DSWE1 and DSWE1 with algal mask if configured
-    if '1a' in dswe:
-      locs_out_457_D1 = locs_stack_ls457.map(lambda image: ref_pull_457_DSWE1(image, feat)).flatten()
-      locs_out_457_D1 = locs_out_457_D1.filter(ee.Filter.notNull(['med_Blue']))
-      locs_srname_457_D1 = proj+'_site_LS457_C2_SRST_DSWE1_'+str(pr)+'_'+str(chunk)+'_v'+run_date
-      locs_dataOut_457_D1 = (ee.batch.Export.table.toDrive(collection = locs_out_457_D1,
-                                              description = locs_srname_457_D1,
-                                              folder = folder_version,
-                                              fileFormat = 'csv',
-                                              selectors = ['system:index',
-                                              'med_Blue', 'med_Green', 'med_Red', 'med_Nir', 'med_Swir1', 'med_Swir2', 
-                                              'med_SurfaceTemp', 'min_SurfaceTemp',
-                                              'sd_Blue', 'sd_Green', 'sd_Red', 'sd_Nir', 'sd_Swir1', 'sd_Swir2', 'sd_SurfaceTemp',
-                                              'mean_Blue', 'mean_Green', 'mean_Red', 'mean_Nir', 'mean_Swir1', 'mean_Swir2', 
-                                              'mean_SurfaceTemp',
-                                              'pCount_dswe_gt0', 'pCount_dswe1', 'pCount_dswe3', 'pCount_dswe1a',
-                                              'pCount_high_opac', 'pCount_unreal_val', 'pCount_sun_glint', 'pCount_ir_glint',
-                                              'pCount_blue_zero', 'pCount_blue_thresh', 'pCount_green_zero', 'pCount_green_thresh', 
-                                              'pCount_red_zero', 'pCount_red_thresh', 'pCount_nir_zero', 'pCount_nir_thresh', 
-                                              'pCount_swir1_zero', 'pCount_swir1_thresh', 'pCount_swir2_zero', 'pCount_swir2_thresh', 
-                                              'pCount_blue_glint', 'pCount_green_glint', 'pCount_red_glint', 'pCount_nir_glint', 
-                                              'pCount_swir1_glint', 'pCount_swir2_glint', 
-                                              'pCount_nir_ir_glint', 'pCount_swir1_ir_glint', 'pCount_swir2_ir_glint',
-                                              'prop_clouds','prop_hillShadow','mean_hillShade']))
-      #Send next task.                                        
-      locs_dataOut_457_D1.start()
-      print('Task sent: Landsat 4, 5, 7 DSWE 1 acquisitions for site configuration at tile ' + str(pr) + ' chunk ' + str(chunk + 1))
-      locs_out_457_D1a = locs_stack_ls457.map(lambda image: ref_pull_457_DSWE1a(image, feat)).flatten()
-      locs_out_457_D1a = locs_out_457_D1a.filter(ee.Filter.notNull(['med_Blue']))
-      locs_srname_457_D1a = proj+'_site_LS457_C2_SRST_DSWE1a_'+str(pr)+'_'+str(chunk)+'_v'+run_date
-      locs_dataOut_457_D1a = (ee.batch.Export.table.toDrive(collection = locs_out_457_D1a,
-                                              description = locs_srname_457_D1a,
-                                              folder = folder_version,
-                                              fileFormat = 'csv',
-                                              selectors = ['system:index',
-                                              'med_Blue', 'med_Green', 'med_Red', 'med_Nir', 'med_Swir1', 'med_Swir2', 
-                                              'med_SurfaceTemp', 'min_SurfaceTemp',
-                                              'sd_Blue', 'sd_Green', 'sd_Red', 'sd_Nir', 'sd_Swir1', 'sd_Swir2', 'sd_SurfaceTemp',
-                                              'mean_Blue', 'mean_Green', 'mean_Red', 'mean_Nir', 'mean_Swir1', 'mean_Swir2', 
-                                              'mean_SurfaceTemp',
-                                              'pCount_dswe_gt0', 'pCount_dswe1', 'pCount_dswe3', 'pCount_dswe1a',
-                                              'pCount_high_opac', 'pCount_unreal_val', 'pCount_sun_glint', 'pCount_ir_glint',
-                                              'pCount_blue_zero', 'pCount_blue_thresh', 'pCount_green_zero', 'pCount_green_thresh', 
-                                              'pCount_red_zero', 'pCount_red_thresh', 'pCount_nir_zero', 'pCount_nir_thresh', 
-                                              'pCount_swir1_zero', 'pCount_swir1_thresh', 'pCount_swir2_zero', 'pCount_swir2_thresh', 
-                                              'pCount_blue_glint', 'pCount_green_glint', 'pCount_red_glint', 'pCount_nir_glint', 
-                                              'pCount_swir1_glint', 'pCount_swir2_glint', 
-                                              'pCount_nir_ir_glint', 'pCount_swir1_ir_glint', 'pCount_swir2_ir_glint',
-                                              'prop_clouds','prop_hillShadow','mean_hillShade']))
-      #Send next task.                                        
-      locs_dataOut_457_D1a.start()
-      print('Task sent: Landsat 4, 5, 7 DSWE 1a acquisitions for site configuration at tile ' + str(pr) + ' chunk ' + str(chunk + 1))
-    
-    else: 
-      # only pull DSWE1
-      locs_out_457_D1 = locs_stack_ls457.map(lambda image: ref_pull_457_DSWE1(image, feat)).flatten()
-      locs_out_457_D1 = locs_out_457_D1.filter(ee.Filter.notNull(['med_Blue']))
-      locs_srname_457_D1 = proj+'_site_LS457_C2_SRST_DSWE1_'+str(pr)+'_'+str(chunk)+'_v'+run_date
-      locs_dataOut_457_D1 = (ee.batch.Export.table.toDrive(collection = locs_out_457_D1,
-                                              description = locs_srname_457_D1,
-                                              folder = folder_version,
-                                              fileFormat = 'csv',
-                                              selectors = ['system:index',
-                                              'med_Blue', 'med_Green', 'med_Red', 'med_Nir', 'med_Swir1', 'med_Swir2', 
-                                              'med_SurfaceTemp', 'min_SurfaceTemp',
-                                              'sd_Blue', 'sd_Green', 'sd_Red', 'sd_Nir', 'sd_Swir1', 'sd_Swir2', 'sd_SurfaceTemp',
-                                              'mean_Blue', 'mean_Green', 'mean_Red', 'mean_Nir', 'mean_Swir1', 'mean_Swir2', 
-                                              'mean_SurfaceTemp',
-                                              'pCount_dswe_gt0', 'pCount_dswe1', 'pCount_dswe3', 'pCount_dswe1a',
-                                              'pCount_high_opac', 'pCount_unreal_val', 'pCount_sun_glint', 'pCount_ir_glint',
-                                              'pCount_blue_zero', 'pCount_blue_thresh', 'pCount_green_zero', 'pCount_green_thresh', 
-                                              'pCount_red_zero', 'pCount_red_thresh', 'pCount_nir_zero', 'pCount_nir_thresh', 
-                                              'pCount_swir1_zero', 'pCount_swir1_thresh', 'pCount_swir2_zero', 'pCount_swir2_thresh', 
-                                              'pCount_blue_glint', 'pCount_green_glint', 'pCount_red_glint', 'pCount_nir_glint', 
-                                              'pCount_swir1_glint', 'pCount_swir2_glint', 
-                                              'pCount_nir_ir_glint', 'pCount_swir1_ir_glint', 'pCount_swir2_ir_glint',
-                                              'prop_clouds','prop_hillShadow','mean_hillShade']))
-      #Send next task.                                        
-      locs_dataOut_457_D1.start()
-      print('Task sent: Landsat 4, 5, 7 DSWE 1 acquisitions for site configuration at tile ' + str(pr) + ' chunk ' + str(chunk + 1))
-    
-  else: print('Not configured to acquire DSWE 1 or DSWE 1a stack for Landsat 4, 5, 7 for site configuration')
-  
-  # pull DSWE3 variants if configured
-  if '3' in dswe:
-    # pull DSWE3
-    locs_out_457_D3 = locs_stack_ls457.map(lambda image: ref_pull_457_DSWE3(image, feat)).flatten()
-    locs_out_457_D3 = locs_out_457_D3.filter(ee.Filter.notNull(['med_Blue']))
-    locs_srname_457_D3 = proj+'_site_LS457_C2_SRST_DSWE3_'+str(pr)+'_'+str(chunk)+'_v'+run_date
-    locs_dataOut_457_D3 = (ee.batch.Export.table.toDrive(collection = locs_out_457_D3,
-                                            description = locs_srname_457_D3,
-                                            folder = folder_version,
-                                            fileFormat = 'csv',
-                                              selectors = ['system:index',
-                                              'med_Blue', 'med_Green', 'med_Red', 'med_Nir', 'med_Swir1', 'med_Swir2', 
-                                              'med_SurfaceTemp', 'min_SurfaceTemp',
-                                              'sd_Blue', 'sd_Green', 'sd_Red', 'sd_Nir', 'sd_Swir1', 'sd_Swir2', 'sd_SurfaceTemp',
-                                              'mean_Blue', 'mean_Green', 'mean_Red', 'mean_Nir', 'mean_Swir1', 'mean_Swir2', 
-                                              'mean_SurfaceTemp',
-                                              'pCount_dswe_gt0', 'pCount_dswe1', 'pCount_dswe3', 'pCount_dswe1a',
-                                              'pCount_high_opac', 'pCount_unreal_val', 'pCount_sun_glint', 'pCount_ir_glint',
-                                              'pCount_blue_zero', 'pCount_blue_thresh', 'pCount_green_zero', 'pCount_green_thresh', 
-                                              'pCount_red_zero', 'pCount_red_thresh', 'pCount_nir_zero', 'pCount_nir_thresh', 
-                                              'pCount_swir1_zero', 'pCount_swir1_thresh', 'pCount_swir2_zero', 'pCount_swir2_thresh', 
-                                              'pCount_blue_glint', 'pCount_green_glint', 'pCount_red_glint', 'pCount_nir_glint', 
-                                              'pCount_swir1_glint', 'pCount_swir2_glint', 
-                                              'pCount_nir_ir_glint', 'pCount_swir1_ir_glint', 'pCount_swir2_ir_glint',
-                                              'prop_clouds','prop_hillShadow','mean_hillShade']))
-    #Send next task.                                        
-    locs_dataOut_457_D3.start()
-    print('Task sent: Landsat 4, 5, 7 DSWE 3 acquisitions for site configuration at tile ' + str(pr) + ' chunk ' + str(chunk + 1))
-    
-  else: print('Not configured to acquire DSWE 3 stack for Landsat 4, 5, 7 for site configuration')
-  
-  #########################################
-  ##---- LANDSAT 89 SITE ACQUISITION ----##
-  #########################################
-  
+  send_combined_task(locs_stack_ls457, feat, 'LS457', chunk)
+
   # pre-process the ls89 stack
-  # snip the ls data by the geometry of the location points    
+  # snip the ls data by the geometry of the location points
   locs_stack_ls89 = (ls89
-    .filterBounds(feat.geometry()) 
+    .filterBounds(feat.geometry())
     # apply fill mask and scaling factors
     .map(apply_fill_mask_89)
     .map(apply_scale_factors))
-    
   # rename bands for ease
   locs_stack_ls89 = locs_stack_ls89.select(bn89, bns89)
-  
   # apply masks that require above rename
   locs_stack_ls89 = (locs_stack_ls89
     .map(apply_rad_mask))
-    
-  if '1' in dswe:
-    if '1a' in dswe:
-      locs_out_89_D1 = locs_stack_ls89.map(lambda image: ref_pull_89_DSWE1(image, feat)).flatten()
-      locs_out_89_D1 = locs_out_89_D1.filter(ee.Filter.notNull(['med_Blue']))
-      locs_srname_89_D1 = proj+'_site_LS89_C2_SRST_DSWE1_'+str(pr)+'_'+str(chunk)+'_v'+run_date
-      locs_dataOut_89_D1 = (ee.batch.Export.table.toDrive(collection = locs_out_89_D1,
-                                              description = locs_srname_89_D1,
-                                              folder = folder_version,
-                                              fileFormat = 'csv',
-                                              selectors = ['system:index',
-                                              'med_Aerosol', 'med_Blue', 'med_Green', 'med_Red', 'med_Nir', 'med_Swir1', 'med_Swir2', 
-                                              'med_SurfaceTemp', 'min_SurfaceTemp',
-                                              'sd_Aerosol', 'sd_Blue', 'sd_Green', 'sd_Red', 'sd_Nir', 'sd_Swir1', 'sd_Swir2', 'sd_SurfaceTemp',
-                                              'mean_Aerosol', 'mean_Blue', 'mean_Green', 'mean_Red', 'mean_Nir', 'mean_Swir1', 'mean_Swir2', 
-                                              'mean_SurfaceTemp',
-                                              'pCount_dswe_gt0', 'pCount_dswe1', 'pCount_dswe3', 'pCount_dswe1a',
-                                              'pCount_high_aero', 'pCount_unreal_val', 'pCount_sun_glint', 'pCount_ir_glint',
-                                              'pCount_aero_zero', 'pCount_aero_thresh',
-                                              'pCount_blue_zero', 'pCount_blue_thresh', 'pCount_green_zero', 'pCount_green_thresh', 
-                                              'pCount_red_zero', 'pCount_red_thresh', 'pCount_nir_zero', 'pCount_nir_thresh', 
-                                              'pCount_swir1_zero', 'pCount_swir1_thresh', 'pCount_swir2_zero', 'pCount_swir2_thresh', 
-                                              'pCount_blue_glint', 'pCount_green_glint', 'pCount_red_glint', 'pCount_nir_glint', 'pCount_swir1_glint',
-                                              'pCount_swir2_glint', 'pCount_nir_ir_glint', 'pCount_swir1_ir_glint', 'pCount_swir2_ir_glint',
-                                              'prop_clouds','prop_hillShadow','mean_hillShade']))
-      #Send next task.                                        
-      locs_dataOut_89_D1.start()
-      print('Task sent: Landsat 8, 9 DSWE 1  acquisitions for site configuration at tile ' + str(pr) + ' chunk ' + str(chunk + 1))
-      
-      locs_out_89_D1a = locs_stack_ls89.map(lambda image: ref_pull_89_DSWE1a(image, feat)).flatten()
-      locs_out_89_D1a = locs_out_89_D1a.filter(ee.Filter.notNull(['med_Blue']))
-      locs_srname_89_D1a = proj+'_site_LS89_C2_SRST_DSWE1a_'+str(pr)+'_'+str(chunk)+'_v'+run_date
-      locs_dataOut_89_D1a = (ee.batch.Export.table.toDrive(collection = locs_out_89_D1a,
-                                              description = locs_srname_89_D1a,
-                                              folder = folder_version,
-                                              fileFormat = 'csv',
-                                              selectors = ['system:index',
-                                              'med_Aerosol', 'med_Blue', 'med_Green', 'med_Red', 'med_Nir', 'med_Swir1', 'med_Swir2', 
-                                              'med_SurfaceTemp', 'min_SurfaceTemp',
-                                              'sd_Aerosol', 'sd_Blue', 'sd_Green', 'sd_Red', 'sd_Nir', 'sd_Swir1', 'sd_Swir2', 'sd_SurfaceTemp',
-                                              'mean_Aerosol', 'mean_Blue', 'mean_Green', 'mean_Red', 'mean_Nir', 'mean_Swir1', 'mean_Swir2', 
-                                              'mean_SurfaceTemp',
-                                              'pCount_dswe_gt0', 'pCount_dswe1', 'pCount_dswe3', 'pCount_dswe1a',
-                                              'pCount_high_aero', 'pCount_unreal_val', 'pCount_sun_glint', 'pCount_ir_glint',
-                                              'pCount_aero_zero', 'pCount_aero_thresh',
-                                              'pCount_blue_zero', 'pCount_blue_thresh', 'pCount_green_zero', 'pCount_green_thresh', 
-                                              'pCount_red_zero', 'pCount_red_thresh', 'pCount_nir_zero', 'pCount_nir_thresh', 
-                                              'pCount_swir1_zero', 'pCount_swir1_thresh', 'pCount_swir2_zero', 'pCount_swir2_thresh', 
-                                              'pCount_blue_glint', 'pCount_green_glint', 'pCount_red_glint', 'pCount_nir_glint', 'pCount_swir1_glint',
-                                              'pCount_swir2_glint', 'pCount_nir_ir_glint', 'pCount_swir1_ir_glint', 'pCount_swir2_ir_glint',
-                                              'prop_clouds','prop_hillShadow','mean_hillShade']))
-      #Send next task.                                        
-      locs_dataOut_89_D1a.start()
-      print('Task sent: Landsat 8, 9 DSWE 1a acquisitions for site configuration at tile ' + str(pr) + ' chunk ' + str(chunk + 1))
-      
-    else:
-      locs_out_89_D1 = locs_stack_ls89.map(lambda image: ref_pull_89_DSWE1(image, feat)).flatten()
-      locs_out_89_D1 = locs_out_89_D1.filter(ee.Filter.notNull(['med_Blue']))
-      locs_srname_89_D1 = proj+'_site_LS89_C2_SRST_DSWE1_'+str(pr)+'_'+str(chunk)+'_v'+run_date
-      locs_dataOut_89_D1 = (ee.batch.Export.table.toDrive(collection = locs_out_89_D1,
-                                              description = locs_srname_89_D1,
-                                              folder = folder_version,
-                                              fileFormat = 'csv',
-                                              selectors = ['system:index',
-                                              'med_Aerosol', 'med_Blue', 'med_Green', 'med_Red', 'med_Nir', 'med_Swir1', 'med_Swir2', 
-                                              'med_SurfaceTemp', 'min_SurfaceTemp',
-                                              'sd_Aerosol', 'sd_Blue', 'sd_Green', 'sd_Red', 'sd_Nir', 'sd_Swir1', 'sd_Swir2', 'sd_SurfaceTemp',
-                                              'mean_Aerosol', 'mean_Blue', 'mean_Green', 'mean_Red', 'mean_Nir', 'mean_Swir1', 'mean_Swir2', 
-                                              'mean_SurfaceTemp',
-                                              'pCount_dswe_gt0', 'pCount_dswe1', 'pCount_dswe3', 'pCount_dswe1a',
-                                              'pCount_high_aero', 'pCount_unreal_val', 'pCount_sun_glint', 'pCount_ir_glint',
-                                              'pCount_aero_zero', 'pCount_aero_thresh',
-                                              'pCount_blue_zero', 'pCount_blue_thresh', 'pCount_green_zero', 'pCount_green_thresh', 
-                                              'pCount_red_zero', 'pCount_red_thresh', 'pCount_nir_zero', 'pCount_nir_thresh', 
-                                              'pCount_swir1_zero', 'pCount_swir1_thresh', 'pCount_swir2_zero', 'pCount_swir2_thresh', 
-                                              'pCount_blue_glint', 'pCount_green_glint', 'pCount_red_glint', 'pCount_nir_glint', 'pCount_swir1_glint',
-                                              'pCount_swir2_glint', 'pCount_nir_ir_glint', 'pCount_swir1_ir_glint', 'pCount_swir2_ir_glint',
-                                              'prop_clouds','prop_hillShadow','mean_hillShade']))
-      #Send next task.                                        
-      locs_dataOut_89_D1.start()
-      print('Task sent: Landsat 8, 9 DSWE 1 acquisitions for site configuration at tile ' + str(pr) + ' chunk ' + str(chunk + 1))
-  
-  else: print('Not configured to acquire DSWE 1 stack for Landsat 8, 9 for site configuration')
-  
-  if '3' in dswe:
-    locs_out_89_D3 = locs_stack_ls89.map(lambda image: ref_pull_89_DSWE3(image, feat)).flatten()
-    locs_out_89_D3 = locs_out_89_D3.filter(ee.Filter.notNull(['med_Blue']))
-    locs_srname_89_D3 = proj+'_site_LS89_C2_SRST_DSWE3_'+str(pr)+'_'+str(chunk)+'_v'+run_date
-    locs_dataOut_89_D3 = (ee.batch.Export.table.toDrive(collection = locs_out_89_D3,
-                                            description = locs_srname_89_D3,
-                                            folder = folder_version,
-                                            fileFormat = 'csv',
-                                            selectors = ['system:index',
-                                              'med_Aerosol', 'med_Blue', 'med_Green', 'med_Red', 'med_Nir', 'med_Swir1', 'med_Swir2', 
-                                              'med_SurfaceTemp', 'min_SurfaceTemp',
-                                              'sd_Aerosol', 'sd_Blue', 'sd_Green', 'sd_Red', 'sd_Nir', 'sd_Swir1', 'sd_Swir2', 'sd_SurfaceTemp',
-                                              'mean_Aerosol', 'mean_Blue', 'mean_Green', 'mean_Red', 'mean_Nir', 'mean_Swir1', 'mean_Swir2', 
-                                              'mean_SurfaceTemp',
-                                              'pCount_dswe_gt0', 'pCount_dswe1', 'pCount_dswe3', 'pCount_dswe1a',
-                                              'pCount_high_aero', 'pCount_unreal_val', 'pCount_sun_glint', 'pCount_ir_glint',
-                                              'pCount_aero_zero', 'pCount_aero_thresh',
-                                              'pCount_blue_zero', 'pCount_blue_thresh', 'pCount_green_zero', 'pCount_green_thresh', 
-                                              'pCount_red_zero', 'pCount_red_thresh', 'pCount_nir_zero', 'pCount_nir_thresh', 
-                                              'pCount_swir1_zero', 'pCount_swir1_thresh', 'pCount_swir2_zero', 'pCount_swir2_thresh', 
-                                              'pCount_blue_glint', 'pCount_green_glint', 'pCount_red_glint', 'pCount_nir_glint', 'pCount_swir1_glint',
-                                              'pCount_swir2_glint', 'pCount_nir_ir_glint', 'pCount_swir1_ir_glint', 'pCount_swir2_ir_glint',
-                                              'prop_clouds','prop_hillShadow','mean_hillShade']))
-    #Send next task.                                        
-    locs_dataOut_89_D3.start()
-    print('Task sent: Landsat 8, 9 DSWE 3 acquisitions for site configuration at tile ' + str(pr) + ' chunk ' + str(chunk + 1))
-  
-  else: print('Not configured to acquire DSWE 3 stack for Landsat 8,9 for sites')
+  send_combined_task(locs_stack_ls89, feat, 'LS89', chunk)
 
 
 def process_dataframe_in_chunks(df, chunk_size=5000):
@@ -2267,8 +1052,61 @@ def process_dataframe_in_chunks(df, chunk_size=5000):
     
     return ()
 
-# and then actualy process the chunks!
-process_dataframe_in_chunks(locations_subset)
+def hilbert_index(x, y, order = 16):
+  """ Position of a point along a Hilbert curve, which keeps points that are
+  close together in space close together in the ordering
+
+  Args:
+      x, y: integer grid coordinates, between 0 and 2^order - 1
+      order: number of bits per coordinate
+
+  Returns:
+      integer position along the curve
+  """
+  d = 0
+  s = 1 << (order - 1)
+  while s > 0:
+    rx = 1 if (x & s) > 0 else 0
+    ry = 1 if (y & s) > 0 else 0
+    d += s * s * ((3 * rx) ^ ry)
+    # rotate the quadrant
+    if ry == 0:
+      if rx == 1:
+        x = s - 1 - x
+        y = s - 1 - y
+      x, y = y, x
+    s >>= 1
+  return d
+
+
+def sort_spatially(df):
+  """ Sort locations along a Hilbert curve so that each chunk of locations is
+  spatially compact. Chunks then overlap less, so fewer image and DEM tiles
+  (and the per-tile hillshade, hillshadow, and DSWE calculations) are computed
+  for more than one chunk. This only changes which chunk a location is in, not
+  its output.
+
+  Args:
+      df: locations dataframe with Latitude and Longitude
+
+  Returns:
+      df sorted along a Hilbert curve (ties broken by id)
+  """
+  n = (1 << 16) - 1
+  lon_range = max(df['Longitude'].max() - df['Longitude'].min(), 1e-9)
+  lat_range = max(df['Latitude'].max() - df['Latitude'].min(), 1e-9)
+  xi = ((df['Longitude'] - df['Longitude'].min()) / lon_range * n).astype(int)
+  yi = ((df['Latitude'] - df['Latitude'].min()) / lat_range * n).astype(int)
+  h = [hilbert_index(x, y) for x, y in zip(xi, yi)]
+  return (df.assign(hilbert = h)
+    .sort_values(['hilbert', 'id'], kind = 'mergesort')
+    .drop(columns = 'hilbert')
+    .reset_index(drop = True))
+
+
+# and then actualy process the chunks! Only path-rows with more than one chunk
+# are affected by the spatial sort
+process_dataframe_in_chunks(sort_spatially(locations_subset))
    
 
 ##############################################

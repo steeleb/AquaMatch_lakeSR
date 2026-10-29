@@ -6,7 +6,8 @@ import os
 # get configs from yml file
 yml = read_csv("b_pull_Landsat_SRST_poi/mid/yml.csv")
 # assign proj
-eeproj = yml["ee_proj"][0]
+# LAKESR_EE_PROJ overrides ee_proj, as in run_GEE_per_pathrow.py
+eeproj = os.environ.get("LAKESR_EE_PROJ") or yml["ee_proj"][0]
 # initialize GEE with proj
 ee.Initialize(project = eeproj)
 # grab run date

@@ -151,7 +151,7 @@ if (config::get(config = general_config)$update_bookdown) {
                                coefficients = e_collated_handoffs
                              ))
                },
-               packages = c("tidyverse", "bookdown", "sf", "tigris", "nhdplusTools", 
+               packages = c("tidyverse", "bookdown", "sf", "tigris",
                             "tmap", "googledrive", "arrow", "kableExtra", "cowplot",
                             "ggthemes", "USA.state.boundaries"),
                deployment = "main")

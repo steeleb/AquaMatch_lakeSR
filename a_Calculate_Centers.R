@@ -5,15 +5,14 @@ tar_source("a_Calculate_Centers/src/")
 
 # Calculate POI Centers for all US and Territories Lakes -------------
 
-# This {targets} list calculates "Point of Inaccessibility", also known as Cheybyshev 
-# Center for all lakes/reservoirs/impoundments greater than 1ha in surface area 
-# using the NHDPlus polygons using the {nhdplusTools} package and the `poi()` 
-# function in the {polylabelr} package. At some point, this workflow will need
-# to be updated to the new USGS 3DHP data, but that isn't complete right now. 
-# Additionally, we are intentionally using NHDPlusV2 instead of NHDPlusHR because
-# of computational time within the scope of this workflow. For HUC4s that are not
-# included in the NHDPlusV2, we access the NHD Best Resolution product directly
-# from the NHD from the National Map url.
+# This {targets} list calculates the "Point of Inaccessibility" (POI), also known
+# as the Chebyshev center, for all lakes/reservoirs greater than 1 ha in surface 
+# area in the USGS National Hydrography Dataset (NHD) Best Resolution product, 
+# using the `poi()` function in the {polylabelr} package. NHD Best Resolution 
+# HU4 GeoPackages are downloaded directly from The National Map. The list of 
+# HU4 files, along with each file's last-modified date and ETag, is recorded in
+# a manifest so that the exact source data for each centers version is 
+# documented and changes to the source files are detected.
 
 # check for configuration setting to calculate centers, if TRUE, calculate centers
 if (config::get(config = general_config)$calculate_centers) {
@@ -36,87 +35,77 @@ if (config::get(config = general_config)$calculate_centers) {
       cue = tar_cue("always")
     ),
     
-    # get {sf}s for all US states and territories from {tigris} to grab all the HUC4s
+    # list all NHD Best Resolution HU4 GeoPackages available on The National 
+    # Map. This target is intentionally not re-run on every pipeline run so that
+    # the source files are fixed for a centers version. To use updated NHD files,
+    # run `tar_invalidate(a_HUC4_manifest)` and create a new centers version.
     tar_target(
-      name = a_US_states_territories,
-      command = states() %>% st_make_valid(),
-      packages = c("tigris", "sf", "tidyverse")
+      name = a_HUC4_manifest,
+      command = get_bestres_manifest(),
+      packages = c("tidyverse", "xml2")
     ),
     
-    # for each state/territory, get a list of HUC4s
-    # while this is not the most efficient (HUC4s cross state boundaries),
-    # this is a good framework to break up HUC acquisition. If you run on the 
-    # boundary of the US, this will completely fail and timeout.
+    # save the manifest alongside the centers output
     tar_target(
-      name = a_HUC4_dataframe,
-      command = get_huc(a_US_states_territories, type = "huc04") %>% 
-        st_drop_geometry(),
-      packages = c("nhdplusTools", "sf", "tidyverse"),
-      pattern = map(a_US_states_territories)
+      name = a_save_HUC4_manifest,
+      command = {
+        a_check_dir_structure
+        file_path <- paste0("a_Calculate_Centers/out/lakeSR_NHD_manifest_", 
+                            lakeSR_config$centers_version, 
+                            ".csv")
+        write_csv(a_HUC4_manifest, file_path)
+        file_path
+      },
+      format = "file"
     ),
     
-    # get distinct HUC4s as a list from the previous target
+    # for each HUC4, download the NHD Best Resolution GeoPackage, subset the 
+    # waterbodies to lakes/reservoirs >= 1 ha, and calculate the POI for each 
+    # polygon
     tar_target(
-      name = a_HUC4_list,
-      command = a_HUC4_dataframe %>% 
-        pull("huc4") %>% 
-        unique()
-    ),
-    
-    # now filter out for HUC4s that are in CONUS (and have NHDPlusV2 waterbodies)
-    tar_target(
-      name = a_CONUS_HUC4,
-      command = a_HUC4_list[as.numeric(a_HUC4_list) < 1900]
-    ),
-    
-    # for each HUC4, grab the NHDPlus waterbodies, subset to lakes/res/
-    # impoundments, subset to >= 1ha, and calculate POI for each polygon
-    # run time for this target is ~ 45 min - 1 hour
-    tar_target(
-      name = a_CONUS_poi,
+      name = a_HUC4_poi,
       command = {
         # need to make sure that the directory structure has been created prior
         # to running this target
         a_check_dir_structure
-        calculate_centers_HUC4(a_CONUS_HUC4)
+        calculate_bestres_centers(a_HUC4_manifest)
       },
-      packages = c("nhdplusTools", "sf", "tidyverse", "polylabelr", "rmapshaper"),
-      pattern = map(a_CONUS_HUC4)
+      packages = c("tidyverse", "sf", "polylabelr", "curl"),
+      pattern = map(a_HUC4_manifest)
     ),
     
-    # and then grab the non-CONUS HUC4s
-    tar_target(
-      name = a_nonCONUS_HUC4,
-      command = a_HUC4_list[as.numeric(a_HUC4_list) >= 1900]
-    ),
-    
-    # now download the NHD Best Resolution file from the National Map, filter
-    # waterbodies, and calculate POIs
-    # run time for this target is > 1h
-    tar_target(
-      name = a_nonCONUS_poi,
-      command = {
-        # need to make sure that the directory structure has been created prior
-        # to running this target
-        a_check_dir_structure
-        calculate_bestres_centers(a_nonCONUS_HUC4)
-      },
-      packages = c("tidyverse", "sf", "polylabelr"),
-      pattern = map(a_nonCONUS_HUC4)
-    ), 
-    
-    # and now we'll join together the two POI files, retaining source information
-    # and the unique identifier from NHD
+    # combine the POIs across HUC4s and assign the lakeSR_id
     tar_target(
       name = a_combined_poi,
       command = {
-        CONUS <- a_CONUS_poi %>% 
-          mutate(nhd_source = "NHDPlusv2")
-        nonCONUS <- a_nonCONUS_poi %>% 
-          mutate(nhd_source = "NHDBestRes")
-        full_join(CONUS, nonCONUS) %>% 
-          mutate(nhd_id = if_else(!is.na(comid), comid, permanent_identifier)) %>% 
-          select(-c(comid, permanent_identifier))
+        # the point on surface fallback in `calculate_poi()` is a safeguard that
+        # is not expected to be used, so `poi_method` is not included in the
+        # output. If it is used, note which waterbodies are affected.
+        fallback <- a_HUC4_poi %>%
+          filter(poi_method != "poi")
+        if (nrow(fallback) > 0) {
+          warning(paste0(nrow(fallback), " waterbodies use a point on surface ",
+                         "instead of the POI: ",
+                         paste(fallback$permanent_identifier, collapse = ", ")))
+        }
+        a_HUC4_poi %>%
+          select(-poi_method) %>%
+          # waterbodies that cross HUC4 boundaries are included in more than one 
+          # HU4 file; keep a single record, preferring the HUC4 that matches the
+          # waterbody's reachcode, then the lowest HUC4
+          mutate(reachcode_match = coalesce(str_sub(reachcode, 1, 4) == huc4, FALSE)) %>% 
+          arrange(permanent_identifier, desc(reachcode_match), huc4) %>% 
+          distinct(permanent_identifier, .keep_all = TRUE) %>% 
+          # lakeSR_id is HUC4_n, where n is assigned in order of the NHD 
+          # permanent identifier, so that ids are reproducible from the 
+          # source data
+          arrange(huc4, permanent_identifier) %>% 
+          mutate(lakeSR_id = paste(huc4, row_number(), sep = "_"), 
+                 .by = huc4) %>% 
+          rename(nhd_id = permanent_identifier) %>% 
+          mutate(nhd_source = "NHDBestRes") %>% 
+          select(-c(reachcode_match, huc4)) %>% 
+          relocate(lakeSR_id, nhd_id)
       }
     ),
     

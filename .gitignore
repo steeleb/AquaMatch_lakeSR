@@ -12,9 +12,11 @@ a_Calculate_Centers/mid/*
 a_Calculate_Centers/out/*
 a_Calculate_Centers/nhd/*
 !a_Calculate_Centers/out/poi_flagged_drive_ids.csv
+!a_Calculate_Centers/out/lakeSR_NHD_manifest_*.csv
 
 b_pull_Landsat_SRST_poi/mid/*
 b_pull_Landsat_SRST_poi/out/*
+b_pull_Landsat_SRST_poi/py/*
 #track drive ids in b group
 !b_pull_Landsat_SRST_poi/out/yml_drive_ids.csv
 

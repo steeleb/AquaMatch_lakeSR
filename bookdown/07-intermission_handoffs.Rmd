@@ -513,7 +513,7 @@ calculated and provide the coefficient tables and diagnostic figures for each
 method. Here, we walk through what applying those coefficients actually looks
 like for a single, densely-sampled lakeSR record, across all seven bands and
 four Landsat missions used in this pipeline (Landsat 5, 7, 8, and 9). We
-use `lakeSR_id` `1102_668` ("Nee Noshe Reservoir", CO) for this example: it has
+use Nee Noshe Reservoir (CO) for this example: it has
 a long, well-populated record across missions (hundreds of observations per
 mission over multiple decades) and, unlike many small or narrow waterbodies in
 lakeSR, it passes the shoreline flags used to fit the handoff coefficients, so
@@ -533,10 +533,11 @@ First, we grab this site's location and shoreline flag information from the
 lakeSR POI file:
 
 ```{r dense-example-location, echo=TRUE}
-dense_id <- "1102_668"
-
 site_info <- a_poi_with_flags %>%
-  filter(lakeSR_id == dense_id)
+  filter(gnis_name == "Nee Noshe Reservoir") %>%
+  slice_max(areasqkm, n = 1)
+
+dense_id <- site_info$lakeSR_id
 
 site_info %>%
   select(lakeSR_id, gnis_name, areasqkm, poi_Latitude, poi_Longitude,
@@ -625,7 +626,7 @@ qa_summary <- dense_raw %>%
 qa_summary %>%
   kable(
     format = "html",
-    caption = "Row counts per mission for lakeSR_id 1102_668 before and after the scene- and row-level QA filters."
+    caption = paste0("Row counts per mission for lakeSR_id ", dense_id, " before and after the scene- and row-level QA filters.")
   ) %>%
   kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>%
   scroll_box(width = "100%")

@@ -120,7 +120,10 @@ if (config::get(config = general_config)$run_GEE) {
                                          locations = b_ref_locations_poi, 
                                          yml = b_yml_poi),
       pattern = map(b_WRS_pathrow_poi),
-      packages = c("tidyverse", "sf", "arrow")
+      packages = c("tidyverse", "sf", "arrow"),
+      # locations is large (~1M rows); shipping it to every crew worker and
+      # building sf objects in parallel crashes workers, so run on main
+      deployment = "main"
     ),
     
     
@@ -153,9 +156,11 @@ if (config::get(config = general_config)$run_GEE) {
       command = {
         b_eeRun_script
         b_yml_poi
+        # the python script reads the locations file written by this target
+        b_poi_locs_filtered
         run_GEE_per_pathrow(WRS_pathrow = b_WRS_pathrow_poi)
       },
-      pattern = map(b_WRS_pathrow_poi),
+      pattern = map(b_WRS_pathrow_poi, b_poi_locs_filtered),
       packages = "reticulate",
       # note, this cannot/should not be used in mulitcore processing mode - the
       # bottleneck here is at GEE, not local processing, and the way the {targets}

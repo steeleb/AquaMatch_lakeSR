@@ -49,22 +49,21 @@ check_if_fully_within_pr <- function(WRS_pathrow, locations, yml) {
   
   # just for kicks, make sure that the PR file is in EPSG:4326. It should be, 
   # but this is our sanity check!
-  if (st_crs(one_PR) != "EPSG:4326") {
-    wrs <- st_transform(one_PR, crs = "EPSG:4326")
+  wrs <- one_PR
+  if (st_crs(wrs) != st_crs("EPSG:4326")) {
+    wrs <- st_transform(wrs, crs = "EPSG:4326")
   }
-  
+
   # get coordinates to calculate UTM zone. This is an adaptation of code from
   # Xiao Yang's code in EE - Yang, Xiao. (2020).
   coord_for_UTM <- wrs %>% st_coordinates()
   mean_x <- mean(coord_for_UTM[,1])
   mean_y <- mean(coord_for_UTM[,2])
   # calculate the UTM zone using the mean value of Longitude for the polygon
-  utm_suffix <- as.character(ceiling((mean_x + 180) / 6))
+  utm_zone <- floor((mean_x + 180) / 6) + 1
   utm_code <- if_else(mean_y >= 0,
-                      # EPSG prefix for N hemisphere
-                      paste0('EPSG:326', utm_suffix),
-                      # for S hemisphere
-                      paste0('EPSG:327', utm_suffix))
+                      32600 + utm_zone, # EPSG prefix for N hemisphere
+                      32700 + utm_zone) # for S hemisphere
   # transform points and wrs to UTM
   wrs <- st_transform(wrs, 
                       crs = utm_code) %>% 
@@ -74,10 +73,9 @@ check_if_fully_within_pr <- function(WRS_pathrow, locations, yml) {
   x_buffd <- st_buffer(x_trans, dist = as.numeric(yml$site_buffer)) %>% 
     st_make_valid()
   # see if the buffered points are completely contained  
-  is_contained_by_WRS = tibble(st_within(x_buffd,
-                                         wrs,
-                                         sparse = FALSE))   
-  names(is_contained_by_WRS) = "is_contained_by_WRS"
+  is_contained_by_WRS = tibble(is_contained_by_WRS = st_within(x_buffd,
+                                                               wrs,
+                                                               sparse = FALSE)[, 1])
   # and bind cols
   filtered <- bind_cols(x, is_contained_by_WRS) %>% 
     st_drop_geometry() %>% 
