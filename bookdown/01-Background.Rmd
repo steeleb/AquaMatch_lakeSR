@@ -8,7 +8,7 @@ bibliography: references.bib
 # Background
 
 Currently, AquaMatch remote sensing products contain data from the historical
-Landsat Collection 2 record from 1984 until the end of 2024, including the
+Landsat Collection 2 record from 1984 until mid-October 2026, including the
 following missions:
 
 -   Landsat 4 Thematic Mapper (TM)
@@ -330,12 +330,14 @@ This {targets} group collates the sites from the WQP, NWIS, and the AquaMatch
 harmonization pipeline, creating a list of locations to acquire remote sensing
 data. All locations are associated with an eight-digit Hydrologic Unit Code
 (HUC8), regardless if one is not listed in the metadata for the site from the
-WQP, then we associate points with waterbodies and flowlines of the NHDPlusV2
-for those in CONUS or NHD Best Resolution for non-CONUS HUCs datasets where
-HUC8s were able to be assigned. This is a very computationally-intensive group
-of functions and can take multiple days to run if `compile_locations` in the
-config file is set to TRUE. We do not recommend running this without at least
-64GB memory available on your computer.
+WQP, then we associate points with waterbodies and flowlines of the NHD Best
+Resolution dataset (for all HUC4s, including those in CONUS) where HUC8s were
+able to be assigned. The NHD Best Resolution GeoPackages are downloaded for each
+HUC4, are checked against a manifest of the files that were available at the
+time of the run, and are removed once all sites have been attributed. This is a
+very computationally-intensive group of functions and can take multiple hours to days to
+run if `compile_locations` in the config file is set to TRUE. We do not
+recommend running this without at least 64GB memory available on your computer.
 
 See section \@ref(siteSR-locs) for details on this process.
 
@@ -361,6 +363,13 @@ configuration `run_GEE` is set to TRUE. If the configuration is set to FALSE,
 run time will be dependent on your internet connection (to access the
 previously-created files) and the number of cores available to run the workflow.
 
+Before acquisition, sites that are very close to one another are grouped, and
+only one site per group (the "extraction site") is sent to GEE to reduce
+redundant compute. Sites are grouped if the buffers around every pair of sites
+in the group overlap by at least 75% of the buffer area and the sites are
+attributed to the same NHD waterbody or flowline (see Section
+\@ref(site-grouping)).
+
 See section \@ref(LS-SRST-pull) for details on this process.
 
 **d_siteSR_qa:**
@@ -379,9 +388,10 @@ This workflow creates a number of files:
 -   locations file
     (`siteSR_collated_WQP_NWIS_sites_with_NHD_info_2025-06-04.csv`) containing
     all sites from the WQP and NWIS at the time of running the pipeline, as well
-    as any additional sites from the AquaMatch pipeline (for Secchi disc depth,
-    chlorophyll *a*, dissolved organic carbon, and total suspended solids) that
-    were not present in the WQP site pull. This file also contains columns
+    as any additional sites from the AquaMatch pipeline (for chlorophyll *a*,
+    colored dissolved organic matter, dissolved organic carbon, Secchi disc
+    depth, total suspended solids, and water color) that were not present in
+    the WQP site pull. This file also contains columns
     attributing a HUC8, NHD features (waterbodies and/or flowlines), and flags
     meant to aid in data interpretation. See Section \@ref(siteSR-locs) for more
     information about this file. This file is the same content as the {targets}
@@ -394,9 +404,23 @@ This workflow creates a number of files:
     identifier (can be matched with the locations file), numerical summaries of
     remote sensing data for each site and satellite image, as well as columns
     containing summarized information about pixels that have been masked in the
-    Google Earth Engine QA and filtering process. See sections
+    Google Earth Engine QA and filtering process. Because sites with
+    overlapping buffers are grouped before acquisition, the siteSR identifier in
+    these files is that of the extraction site for the group; use the
+    extraction site crosswalk file (below) to match the data to every site. See
+    sections
     \@ref(LS-C2-SRST), \@ref(LS-SRST-pull), and \@ref(post-hoc-qa) for
     additional details.
+
+-   extraction site crosswalk file
+    (`siteSR_extraction_site_crosswalk_v[GEE run date].csv`) which has a row for
+    every siteSR site deemed visible by remote sensing and provides the siteSR
+    identifier of the extraction site that represents it
+    (`extraction_siteSR_id`), the number of sites in the group
+    (`n_sites_in_cluster`), the basis for the group (`cluster_basis`), the
+    distance to the extraction site (`dist_to_extraction_site_m`), and the NHD
+    assignment and shoreline flags at the extraction site (columns beginning
+    with `extraction_`). See Section \@ref(site-grouping) for more information.
 
 -   remote sensing scene-level metadata file(s) (e.g.
     `siteSR_collated_metadata_LS89_2025-06-06.csv`,
@@ -430,7 +454,9 @@ profiles: "default" and "admin_update".
     also be used by others to re-run the pipeline and wish to make changes to
     the site location collation ({targets} group -a-), remote sensing visibility
     thresholds ({targets} group -b-) or GEE implementation ({targets} group
-    -c-).
+    -c-). This profile also sets `overlap_threshold`, the minimum percent of
+    buffer area that every pair of sites must share to be grouped into a single
+    extraction site (75 by default, see Section \@ref(site-grouping)).
 
 All repositories stored on the AquaMatch GitHub will contain files that link to
 versions of the data that the AquaMatch team has harmonized so that a local run

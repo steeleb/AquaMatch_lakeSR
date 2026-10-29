@@ -419,7 +419,10 @@ since some of the AquaMatch parameter harmonization was queried at a different
 time than the query for siteSR. The siteSR pipeline collates these sites, then
 reduces that collation to only distinct sites defined by organization
 identifier, monitoring location identifier, WGS84 latitude and WGS84 longitude.
-Across the WQP, NWIS, and the harmonization pipeline, there are currently
+Characters that cause issues in delimited files (double quotes and control
+characters, such as line breaks) are removed from the location identifiers and
+other text fields, and any sites that are duplicates after this cleaning are
+dropped. Across the WQP, NWIS, and the harmonization pipeline, there are currently
 `r format(nrow(a_sites_with_NHD_info), big.mark = ",")` sites in the United
 States and territories for which we attempt to create "stacks" of remote sensing
 data. A "stack" refers to all the remote sensing data available during a time
@@ -484,19 +487,21 @@ a_sites_with_NHD_info %>%
 
 **HUC8 assignment**
 
-For each siteSR location, we attempt to assign HUC8's using the `get_huc()`
-function in the {nhdplusTools} [@blodgett2023] package in R. While there is a
+For each siteSR location, we attempt to assign HUC8's by intersecting the
+location with the Watershed Boundary Dataset (WBD) HUC8 polygons, which are
+downloaded once using the {hydrogeofetch} [@blodgett2023] package in R (formerly
+{nhdplusTools}) rather than queried for each site. While there is a
 column (`HUCEightDigitCode`) provided with WQP sites query that attributes a
 HUC8 to sites, some of them are missing data (n =
 `r a_sites_with_NHD_info %>% filter(source == "WQP" & is.na(HUCEightDigitCode)) %>% nrow(.)`)
 and some of them differ from those obtained using the reported location latitude
-and longitude and the `get_huc()` function (n =
+and longitude and the WBD HUC8 polygons (n =
 `r a_sites_with_NHD_info %>% filter(source == "WQP" & flag_HUC8 == 2) %>% nrow(.)`).
 Additionally, NWIS sites are not associated with HUC8's when queried and this
 process assigns a HUC8 as a value add to downstream users. These HUC assignments
 are stored in the `assigned_HUC` column in the siteSR site file. After this
 process, only `r a_sites_with_NHD_info %>% filter(flag_HUC8 >= 3) %>% nrow(.)`
-sites remained without a HUC8 assignment using the nhdplusTools method. Most of
+sites remained without a HUC8 assignment using the WBD intersection. Most of
 these sites were coastal sites outside of the extent of NHD boundaries (n =
 `r a_sites_with_NHD_info %>% filter(flag_HUC8 == 4) %>% nrow(.)`) or were
 assigned a HUC8 in the WQP data and were estuaries, but were unable to be
@@ -508,26 +513,29 @@ remain in siteSR, but those without an assigned HUC8 using this process
 In siteSR, we provide a `flag_HUC8` column in the siteSR site file with the
 following code definitions:
 
-> 0: HUC8 reported in WQP site information, matches nhdplusTools assignment
+> 0: HUC8 reported in WQP site information, matches WBD assignment
 >
-> 1: HUC8 successfully assigned using nhdplusTools, no HUC8 reported in
+> 1: HUC8 successfully assigned using the WBD, no HUC8 reported in
 > HUCEightDigitCode
 >
 > 2: HUC8 mismatch between Water Quality Portal HUCEightDigitCode assignment and
-> nhdplusTools assignment
+> WBD assignment
 >
 > 3: HUCEightDigitCode was assigned to a site type of estuary, but not able to
-> be assigned using the nhdplusTools method
+> be assigned using the WBD
 >
-> 4: HUC8 unable to be assigned for site location using the nhdplusTools method
-> and was not provided by WQP/NWIS site information
+> 4: HUC8 unable to be assigned for site location using the WBD and was not
+> provided by WQP/NWIS site information
 
 **NHD Waterbody Feature Assignment**
 
-Using the assigned HUC8 information to iterate, we then can use {nhdplusTools}
-to assign waterbodies and flowlines to sites within the CONUS and data from The
-National Map best resolution files [e.g. @usgeologicalsurvey] for sites outside
-of CONUS by HUC4. For all sites with a `harmonized_site_type` of Lake/Reservoir,
+Using the assigned HUC8 information, we assign waterbodies and flowlines to
+sites using the NHD Best Resolution files from The National Map
+[e.g. @usgeologicalsurvey], iterating by HUC4. The GeoPackage for each HUC4 is
+downloaded once and checked against a manifest recording the version of each
+file available at the time of the run, so that the NHD data used are known and
+reproducible. Distances and buffers are calculated in the local UTM zone of each
+HUC4. For all sites with a `harmonized_site_type` of Lake/Reservoir,
 Pond, Estuary or Other, we assign NHD ids to each point for the NHD waterbody
 feature it is contained by or the NHD feature it is closest to. The NHD
 waterbody layer has been filtered to only contain Lake, Ponds, Reservoirs, and
@@ -551,8 +559,7 @@ assignment as follows:
 
 For all points with a flag value of 0, 1, and 2, we provide the NHD identifier
 (`wb_nhd_id` in the siteSR site file) for the polygon the monitoring location is
-associated with (comid for NHDPlusV2 and permanent identifier for NHD Best
-Resolution), for all points with a flag value of 1, 2, and 3, we provide the
+associated with (the NHD Best Resolution permanent identifier), for all points with a flag value of 1, 2, and 3, we provide the
 distance (in meters) to the nearest NHD waterbody (`dist_to_wb` in siteSR site
 file) of feature type 390, 436, or 493. For waterbodies with a flag of 0, we
 provide distance to shore (`dist_to_shore` in siteSR site file).
@@ -603,7 +610,7 @@ NHD waterbody features) (NHD feature types 460, 336, and 558). We flag
 
 For all points with a flag 0-3 we provide the NHD identifier (`fl_nhd_id` in the
 siteSR site file) for the flowline the monitoring location is associated with
-(comid for NHDPlusV2 and permanent identifier for NHD Best Resolution), for all
+(permanent identifier from the NHD Best Resolution), for all
 points with a flag value of 0-4, we provide the distance (in meters) to the
 nearest NHD flowline (`dist_to_fl` in siteSR site file) of feature type 460,
 558, 336.
@@ -627,13 +634,14 @@ related to edge/shoreline contamination) and NHD common unique identifier
 available flags to assess uncertainty to those assignments or the buffered area
 relative to the site.
 
-Note that the siteSR site file noted above collates NHD Best Resolution
-permanent identifiers and NHDPlusV2 comid values into a column for waterbody
-features `wb_nhd_id` and one for flowline features `fl_nhd_id`. The upstream
-source of the NHD data is noted in `wb_nhd_source` and `fl_nhd_source` columns
-to allow users to know whether the value in the `wb_nhd_id` or `fl_nhd_id`
-columns is a NHD Best Resolution permanent identifier (NHDBestRes) or a
-NHDPlusV2 COMID (NHDPlusV2).
+In the current version of the site file, all sites are assigned using NHD Best Resolution. 
+Note that earlier versions of the siteSR site file (2025-06-04 and 2026-01-28)
+collate NHD Best Resolution permanent identifiers and NHDPlusV2 comid values
+into a column for waterbody features `wb_nhd_id` and one for flowline features
+`fl_nhd_id`. The upstream source of the NHD data is noted in `wb_nhd_source` and
+`fl_nhd_source` columns to allow users to know whether the value in the
+`wb_nhd_id` or `fl_nhd_id` columns is a NHD Best Resolution permanent identifier
+(NHDBestRes) or a NHDPlusV2 COMID (NHDPlusV2). 
 
 ### Assessing for remote sensing visibility
 
@@ -669,6 +677,81 @@ b_visible_sites %>%
   theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
   geom_text(aes(label = after_stat(count)), stat = "count", vjust = -0.5, colour = "black", size = 3)
 ```
+
+### Grouping sites to reduce redundant extraction {#site-grouping}
+
+Many siteSR sites are very close to one another, so that extracting Landsat
+data at each of them repeats the same pixels many times in GEE. To reduce this
+redundant compute, we group the sites deemed visible by remote sensing, after
+the visibility assessment and before the GEE data acquisition, and send only
+one site per group (the "extraction site") to GEE. This is orchestrated in the
+{targets} group `c_siteSR_stack`.
+
+Sites are grouped when both of the following are true:
+
+-   *Buffer overlap.* The GEE buffers (200 m radius) of **every pair** of sites
+    in the group overlap by at least 75% of the buffer area. For two equal-radius
+    circles, overlap depends only on the distance between their centers, so a
+    75% overlap of a 200 m buffer corresponds to sites that are within
+    approximately 79 m of each other. The overlap threshold is set with
+    `overlap_threshold` in the `admin_update` profile of `config.yml`. Because
+    every pair must meet the threshold, no site in a group overlaps another by
+    less than the threshold (grouping sites by their distance to a single site
+    would allow the sites at either edge of a group to overlap by less).
+-   *Same NHD feature or site type.* Lake/Reservoir and Pond sites must be
+    attributed to the same NHD waterbody (`wb_nhd_id`) and Stream and
+    Ditch/Canal sites must be attributed to the same NHD flowline
+    (`fl_nhd_id`), regardless of the value of `flag_wb` or `flag_fl`. Lake/Reservoir,
+    Pond, Stream, and Ditch/Canal sites that were not able to be attributed to an
+    NHD feature are not grouped. Estuary and Other sites, which are
+    less consistently attributed to NHD features, are grouped with sites of the
+    same `harmonized_site_type`.
+
+Groups are formed by ordering sites in space and, beginning with the first site
+that is not yet in a group, adding neighboring sites that meet the criteria
+above with every site already in the group. The ordering is deterministic so
+that the groups are reproducible.
+
+The extraction site is a site that is a member of the group, so the acquired
+data are always associated with a siteSR identifier that exists in the siteSR
+site file. For lake and river sites, we prioritize the member with the best
+waterbody (`flag_wb`) or flowline (`flag_fl`) assignment flag, and among those
+choose the site with the smallest total distance to the other members of the
+group (the medoid), then the lowest siteSR identifier. When all sites in a group
+have identical coordinates, which is the case for many groups, the choice of
+extraction site has no effect on the data.
+
+The shoreline and NHD assignment flags describe the area summarized in GEE.
+Because the data for a group are extracted at the extraction site, the flags at
+the extraction site (`extraction_flag_wb`, `extraction_flag_fl`,
+`extraction_dist_to_shore`, `extraction_dist_to_fl`, and the four
+`extraction_flag_*_shoreline` columns) apply to every site in the group and
+should be used when filtering remote sensing data for shoreline contamination.
+The flags in the siteSR site file describe the individual site location and may
+differ from those at the extraction site for a small number of groups.
+
+Grouping the sites does not change the number of siteSR sites. The extraction
+site crosswalk file (`siteSR_extraction_site_crosswalk_v[GEE run date].csv`)
+provides, for every siteSR site that was deemed visible by remote sensing, the
+siteSR identifier of the extraction site (`extraction_siteSR_id`), so that
+remote sensing data can be matched to all sites in a group, along with the
+number of sites in the group (`n_sites_in_cluster`), the basis for the grouping
+(`cluster_basis`: waterbody, flowline, location_and_type, or unclustered), and
+the distance of the site to the extraction site in meters
+(`dist_to_extraction_site_m`). The remote sensing data files contain data only
+for extraction sites. We provide the data this way, rather than duplicating
+the data for every site in a group, to limit the size of the data files.
+
+Two considerations when using the data:
+
+-   Sites in a group are within approximately 79 m of the extraction site,
+    but their buffers are not identical. Surface reflectance and temperature
+    summaries from the extraction site are representative of the other sites'
+    buffers, not exact summaries of them.
+-   The path-row containment check for a site's buffer is applied to the
+    extraction site. The buffer for another site in a group may be completely
+    contained by a path-row that does not completely contain the buffer of the
+    extraction site, in which case that site has no data from that path-row.
 
 ### siteSR updates in AquaMatch
 

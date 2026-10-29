@@ -36,8 +36,9 @@ siteSR workflow, versions used, and the associated citation.
 | ggthemes             |  5.1.0   | @arnold2024                |
 | googledrive          |  2.1.1   | @mcgowan2023               |
 | kableExtra           |  1.4.0   | @zhu2024                   |
-| nhdplusTools         |  0.6.2   | @blodgett2023              |
+| hydrogeofetch        |  2.0.3   | @blodgett2023              |
 | polylabelr           |  0.3.0   | @larsson2024               |
+| RANN                 |  2.6.2   | @jefferis2024              |
 | reticulate           |  1.42.0  | @ushey2025                 |
 | rmapshaper           |  0.5.0   | @teucher2023               |
 | sf                   |  1.0-21  | @pebesma2018; @pebesma2023 |
