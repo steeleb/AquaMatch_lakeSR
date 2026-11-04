@@ -31,7 +31,8 @@ the WQP, NWIS, and any sites present in the AquaMatch_harmonize pipeline not
 available via WQP at the time of site collation. At the time of collation, the
 AquaMatch_harmonize pipeline contained data for Secchi disc depth (SDD)
 [@delatorre], chlorophyll *a* (chla) [@brousil], dissolved organic carbon (DOC)
-[@brousila], and total suspended solids (TSS) [@brousilb].
+[@brousila], total suspended solids (TSS) [@brousilb], colored dissolved
+organic matter (CDOM), and water color.
 
 ## lakeSR Code Architecture
 
@@ -467,7 +468,7 @@ is not necessitated unless changes are made in upstream steps of the workflow.
 This configuration file defines parameters of the GEE pull. This configuration
 can be customized. To create a different configuration of the GEE pull, fill out
 the yaml file at the file path `gee_config.yml`. If you change the name of this
-file, you will need to update the file name at line 9 of the
+file, you will need to update the file name at line 17 of the
 `b_determine_RS_visibility.R` script. No GEE configuration is required if
 `run_pekel` and `run_GEE` is set to FALSE in the general configuration file.
 
@@ -488,8 +489,13 @@ The siteSR folder structure is as follows:
             |-- add_HUC8_to_sites.R
             |-- add_NHD_flowline_to_sites.R
             |-- add_NHD_waterbody_to_sites.R
+            |-- clean_text_fields.R
+            |-- distance_to_nearest_feature.R
+            |-- download_bestres_gpkg.R
+            |-- get_bestres_manifest.R
             |-- get_site_info.R
             |-- harmonize_crs.R
+            |-- set_local_utm.R
     |-- b_determine_RS_visibility.R
     |-- b_determine_RS_visibility
         |-- py
@@ -500,7 +506,7 @@ The siteSR folder structure is as follows:
         |-- src
             |-- check_for_containment.R
             |-- download_csvs_from_drive.R
-            |-- format_yml.R
+            |-- format_yaml.R
             |-- get_WRS_pathrows.R
             |-- grab_locs.R
             |-- run_pekel_per_pathrow.R
@@ -512,14 +518,17 @@ The siteSR folder structure is as follows:
             |-- siteSR_wait_for_completion.py
         |-- src
             |-- check_if_fully_within_pr.R
+            |-- cluster_sites_for_GEE.R
             |-- collate_csvs_from_drive.R
             |-- download_csvs_from_drive.R
-            |-- run_stieSR_per_pathrow.R
+            |-- run_siteSR_per_pathrow.R
+            |-- split_combined_dswe.R
     |-- d_qa_stack.R
     |-- d_qa_stack
         |-- src
-            |-- prep_Landsat_for_export.R
+            |-- prep_LS_metadata_for_export.R
             |-- qa_and_document_LS.R
+            |-- sort_qa_Landsat_data.R
     |-- src
         |-- export_single_file.R
         |-- export_single_target.R

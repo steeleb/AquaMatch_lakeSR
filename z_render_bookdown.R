@@ -111,6 +111,8 @@ if (config::get(config = general_config)$update_bookdown) {
                  d_qa_Landsat_files
                  move_siteSR_drop_images
                  move_lakeSR_drop_images
+                 # needed for site-grouping examples
+                 c_crosswalk_examples
                  # needed for dense-record handoff example
                  d_lakeSR_feather_files
                  d_qa_version_identifier
@@ -142,6 +144,7 @@ if (config::get(config = general_config)$update_bookdown) {
                                locs_run_date = lakeSR_config$collated_version,
                                sites = a_sites_with_NHD_info,
                                visible_sites = b_visible_sites,
+                               crosswalk_examples = c_crosswalk_examples,
                                LS5_for57 = e_LS5_forLS57corr_quantiles,
                                LS7_for57 = e_LS7_forLS57corr_quantiles,
                                LS7_for78 = e_LS7_forLS78corr_quantiles,

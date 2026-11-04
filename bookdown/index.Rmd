@@ -14,6 +14,7 @@ params:
   locs_run_date: NA
   sites: NA
   visible_sites: NA
+  crosswalk_examples: NA
   LS5_for57: NA
   LS7_for57: NA
   LS7_for78: NA

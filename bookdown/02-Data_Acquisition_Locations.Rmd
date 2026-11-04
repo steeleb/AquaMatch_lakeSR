@@ -8,6 +8,7 @@ params:
   locs_run_date: NA
   sites: NA
   visible_sites: NA
+  crosswalk_examples: NA
 ---
 
 ```{r chunk-opts-2, echo=FALSE}
@@ -461,16 +462,16 @@ a_sites_with_NHD_info %>%
 ### Harmonizing siteSR site types {#rs-vis}
 
 In order to harmonize the site types across WQP and NWIS data providers, we
-attempt to generalize site types into five groups: Lake/Reservoir/Pond, Stream,
-Canal/Ditch, Estuary, Other. These designations are stored in the column
+attempt to generalize site types into six groups: Lake/Reservoir, Pond, Stream,
+Ditch/Canal, Estuary, Other. These designations are stored in the column
 `harmonized_site_type` in the siteSR site file.
 
 | AquaMatch harmonized_site_type | NWIS site_tp_cd | WQP MonitoringLocationTypeName |
 |---------------------------|---------------------------|---------------------------|
 | Lake/Reservoir | LK | contains "lake", "reservoir", or "impoundment" |
 | Pond | no associated code | contains "pond" |
-| Stream | ST | contains "stream" |
-| Canal/Ditch | ST-CA, ST-DCH | contains "canal" or "ditch" |
+| Stream | ST | contains "stream" (includes "Stream: Canal" and "Stream: Ditch") |
+| Ditch/Canal | ST-CA, ST-DCH | contains "canal" or "ditch" and does not contain "stream" |
 | Estuary | ES | Estuary |
 | Other | all remaining codes | all remaining codes |
 
@@ -599,12 +600,13 @@ NHD waterbody features) (NHD feature types 460, 336, and 558). We flag
 > 2: point between GEE buffer distance and 500 meters from nearest NHD flowline
 > feature
 >
-> 3: point unable to be assigned to a NHD flowline for a stream/canal site
+> 3: point unable to be assigned to a NHD flowline for a stream/river/canal/ditch site
 > because distance to nearest NHD flowline feature \> 500 meters
 >
-> 4: point is a lake/reservoir/pond/other/estuary (defined by
+> 4: point is a lake/reservoir/pond (defined by
 > harmonized_site_type) and is \> 500 meters away from nearest NHD flowline
-> feature
+> feature. Estuary and Other sites more than 500 meters from a flowline retain
+> their flowline information and are not assigned a `flag_fl` value.
 >
 > 5: point does not have HUC8 assignment. No flowline assigned.
 
@@ -752,6 +754,159 @@ Two considerations when using the data:
     extraction site. The buffer for another site in a group may be completely
     contained by a path-row that does not completely contain the buffer of the
     extraction site, in which case that site has no data from that path-row.
+
+#### Grouping examples {#site-grouping-examples}
+
+```{r grouping-setup}
+cwx <- params$crosswalk_examples
+cwx_sum <- cwx$summary
+basis_red <- function(b) {
+  cwx_sum$by_basis %>% filter(cluster_basis == b) %>% pull(reduction_pct)
+}
+# caption for a map: the feature and location are in the figure title
+map_cap <- function(ex, what) {
+  basis <- c(waterbody = "waterbody", flowline = "flowline",
+             location_and_type = "location and site type")[ex$focus_basis]
+  paste0(what, " ", ex$n_sites_focus, " ", paste(ex$focus_type, collapse = "/"),
+         " sites, grouped by ", basis, ", are represented by ",
+         ex$n_extraction_focus, " extraction site",
+         if (ex$n_extraction_focus > 1) "s", ".")
+}
+```
+
+Grouping reduced the number of sites sent to GEE from
+`r format(cwx_sum$n_sites, big.mark = ",")` to
+`r format(cwx_sum$n_extraction, big.mark = ",")`
+(`r round(100 * (1 - cwx_sum$n_extraction / cwx_sum$n_sites), 1)`% fewer). The
+reduction was `r basis_red("flowline")`% for sites attributed to a flowline,
+`r basis_red("waterbody")`% for sites attributed to a waterbody, and
+`r basis_red("location_and_type")`% for sites grouped by location and type.
+Sites without an NHD attribution
+(`r format(cwx_sum$by_basis %>% filter(cluster_basis == "unclustered") %>% pull(sites), big.mark = ",")`)
+are never grouped. The examples below were selected by rule from the crosswalk.
+In the maps, dashed circles are the 200 m GEE buffers of the sites sent to GEE,
+numbers are the count of sites a group represents, and gray lines connect
+grouped sites to their extraction site. Sites that share the location of their
+extraction site are drawn beneath it, and sites in gray are not part of the
+example. NHD Best Resolution waterbodies (labeled in italics by name or, if
+unnamed, by type) and flowlines are shown in blue.
+
+Figure \@ref(fig:overlap-illustration) shows the grouping distance: 200 m
+buffers whose centers are ~79 m apart overlap by 75% of their area.
+
+```{r overlap-illustration, fig.cap = "Two 200 m GEE buffers (dashed circles) with centers ~79 m apart, the maximum grouping distance. The overlap (shaded) is 75% of the buffer area.", fig.alt = "Two overlapping circles of 200 m radius whose centers are about 79 meters apart. The lens-shaped intersection is shaded orange and covers most of each circle.", fig.height = 3, fig.width = 4.5}
+r <- 200
+ov <- 0.75
+overlap_fn <- function(d) {
+  (2 * r^2 * acos(d / (2 * r)) - (d / 2) * sqrt(4 * r^2 - d^2)) / (pi * r^2) - ov
+}
+d <- uniroot(overlap_fn, interval = c(0, 2 * r))$root
+c1 <- st_buffer(st_sfc(st_point(c(-d / 2, 0))), r)
+c2 <- st_buffer(st_sfc(st_point(c(d / 2, 0))), r)
+ggplot() +
+  geom_sf(data = st_intersection(c1, c2), fill = "#E8833A", alpha = 0.6, colour = NA) +
+  geom_sf(data = c1, fill = NA, colour = "#C9591C", linetype = "dashed") +
+  geom_sf(data = c2, fill = NA, colour = "#C9591C", linetype = "dashed") +
+  geom_sf(data = st_sfc(st_point(c(-d / 2, 0)), st_point(c(d / 2, 0))),
+          shape = 21, fill = "white", size = 2) +
+  annotate("segment", x = -d / 2, xend = d / 2, y = -40, yend = -40,
+           arrow = arrow(ends = "both", length = unit(0.05, "in"))) +
+  annotate("text", x = 0, y = -62, label = paste0(round(d), " m"), size = 3) +
+  theme_void()
+```
+
+**Many sites at one location.** Different monitoring locations are sometimes
+recorded at the same coordinates. The largest groups are extreme cases. The
+largest group overall (Figure \@ref(fig:largest-group)) is made of Stream sites,
+which are grouped by flowline even though the NHD places the site within a
+waterbody polygon. The largest group based on a waterbody is shown in Figure
+\@ref(fig:largest-waterbody-group).
+
+```{r largest-group, fig.cap = map_cap(cwx$largest, "The largest group (flowline in dark blue; the labeled polygon is not used for grouping):"), fig.alt = "A map of a wide river arm with a dark blue flowline running through it and one orange diamond, labeled with the number of sites it represents, inside a dashed 200 meter circle.", fig.height = crosswalk_fig_height(cwx$largest, 6), fig.width = 6}
+map_crosswalk_example(cwx$largest)
+```
+
+```{r largest-waterbody-group, fig.cap = map_cap(cwx$largest_waterbody, "The largest group based on a waterbody (dark outline):"), fig.alt = "A map of a reservoir shoreline with one orange diamond, labeled with the number of sites it represents, inside a dashed 200 meter circle, and a few gray dots for other sites.", fig.height = crosswalk_fig_height(cwx$largest_waterbody, 6), fig.width = 6}
+map_crosswalk_example(cwx$largest_waterbody)
+```
+
+**Sites in a waterbody.** Sites in the same part of a waterbody are grouped,
+while sites that are more than ~79 m apart remain separate. The ungrouped site
+(purple) in Figure \@ref(fig:waterbody-example) is too far from any other site to
+be grouped.
+
+```{r waterbody-example, fig.cap = map_cap(cwx$waterbody, "A single waterbody (dark outline):"), fig.alt = "A map of a lake with orange diamonds, each inside a dashed 200 meter circle and labeled with the number of sites it represents, and one purple triangle. White dots connected to the diamonds by gray lines are the sites grouped with each.", fig.height = crosswalk_fig_height(cwx$waterbody, 6.5), fig.width = 6.5}
+map_crosswalk_example(cwx$waterbody)
+```
+
+**Sites on a flowline.** Stream and Ditch/Canal sites are grouped by NHD
+flowline, never by waterbody (Figure \@ref(fig:flowline-sparse-example)), so a
+stream site that falls within a waterbody polygon, as in Figure
+\@ref(fig:largest-group), is still grouped with the sites on its flowline. Sites
+near the flowline that are attributed to a different flowline are not grouped
+with it, which matters most where there are many sites close together (Figure
+\@ref(fig:flowline-example)).
+
+```{r flowline-sparse-example, fig.cap = map_cap(cwx$flowline_sparse, "A single flowline (dark blue):"), fig.alt = "A map of a river segment, highlighted in dark blue, with two orange diamonds labeled with the number of sites they represent and two purple triangles, each inside a dashed 200 meter circle. A few gray dots are sites that are not on this flowline.", fig.height = crosswalk_fig_height(cwx$flowline_sparse, 6.5), fig.width = 6.5}
+map_crosswalk_example(cwx$flowline_sparse)
+```
+
+```{r flowline-example, fig.cap = map_cap(cwx$flowline, "A single flowline (dark blue) in a corridor with many sites. Other sites are colored by the flowline they are attributed to, for the four most common flowlines:"), fig.alt = "A map of a short river segment, highlighted in dark blue, with several orange diamonds each inside a dashed 200 meter circle and labeled with the number of sites it represents. Many other dots are colored by the other flowlines they are attributed to; the dots and flowlines in the same color are the same flowline.", fig.height = crosswalk_fig_height(cwx$flowline, 6.5), fig.width = 6.5}
+map_crosswalk_example(cwx$flowline, color_context = TRUE)
+```
+
+**Sites that are not grouped.**
+`r round(100 * mean(cwx_sum$cluster_sizes$n_sites_in_cluster == 1), 0)`% of
+extraction sites
+(`r format(sum(cwx_sum$cluster_sizes$n_sites_in_cluster == 1), big.mark = ",")`)
+are not grouped with any other site. Many have close neighbors, but are
+attributed to different NHD features or are more than ~79 m away (Figure
+\@ref(fig:singleton-example)).
+
+```{r singleton-example, fig.cap = "Ungrouped sites (purple triangles) near other sites. The buffers overlap, but the sites are attributed to different NHD features or are too far apart to be grouped.", fig.alt = "A map of a stream flowing into a wide waterbody with many purple triangles, each in a dashed 200 meter circle that overlaps its neighbors. A few orange diamonds with small numbers mark groups of two to four sites.", fig.height = crosswalk_fig_height(cwx$singletons, 6), fig.width = 6}
+map_crosswalk_example(cwx$singletons)
+```
+
+**Across all sites.** `r round(100 * mean(cwx_sum$distances$dist_to_extraction_site_m == 0), 0)`%
+of the sites that are not sent to GEE are at the exact location of their
+extraction site, and none is farther than
+`r max(cwx_sum$distances$dist_to_extraction_site_m)` m
+(Figure \@ref(fig:grouping-summary)). Reductions by site type are in Table
+\@ref(tab:grouping-by-type).
+
+```{r grouping-summary, fig.cap = "Summary of the siteSR site grouping. (a) Number of extraction sites by the number of sites they represent (20+ combined). (b) Distance between each grouped site and its extraction site; sites at the same location as the extraction site are at 0 m.", fig.alt = "Two-panel figure. The left panel is a bar chart on a log scale showing that most extraction sites represent one site, with fewer representing two, three and more sites. The right panel is a histogram of the distance of grouped sites to their extraction site, showing a large bar at zero meters and a tail that ends at about 79 meters.", fig.height = 3.5, fig.width = 7}
+size_plot <- cwx_sum$cluster_sizes %>%
+  mutate(size = pmin(n_sites_in_cluster, 20)) %>%
+  count(size) %>%
+  ggplot(aes(x = size, y = n)) +
+  geom_col(fill = "#E8833A") +
+  scale_y_log10(labels = scales::label_comma()) +
+  scale_x_continuous(breaks = c(1, 5, 10, 15, 20),
+                     labels = c(1, 5, 10, 15, "20+")) +
+  labs(x = "Sites represented by an extraction site", 
+       y = "Extraction sites (log scale)") +
+  theme_bw()
+
+dist_plot <- cwx_sum$distances %>%
+  ggplot(aes(x = dist_to_extraction_site_m)) +
+  geom_histogram(binwidth = 5, boundary = 0, fill = "#E8833A", colour = "white") +
+  scale_y_continuous(labels = scales::label_comma()) +
+  labs(x = "Distance to extraction site (m)", y = "Grouped sites") +
+  theme_bw()
+
+cowplot::plot_grid(size_plot, dist_plot, labels = c("a", "b"))
+```
+
+```{r grouping-by-type}
+cwx_sum$by_type %>% 
+  arrange(desc(sites)) %>% 
+  transmute(`Site type` = coalesce(harmonized_site_type, "Unassigned"),
+            `RS-visible sites` = format(sites, big.mark = ","),
+            `Sites sent to GEE` = format(extraction_sites, big.mark = ","),
+            `Reduction (%)` = reduction_pct) %>% 
+  knitr::kable(caption = "Number of RS-visible sites and the number of sites sent to GEE after grouping, by harmonized site type.", 
+               align = "lrrr")
+```
 
 ### siteSR updates in AquaMatch
 

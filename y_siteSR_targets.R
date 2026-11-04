@@ -101,6 +101,34 @@ if (config::get(config = general_config)$update_bookdown) {
       },
       packages = c("tidyverse", "googledrive"),
       cue = tar_cue("always")
+    ),
+    
+    # spatial data for the site-grouping examples in the bookdown (made in the 
+    # siteSR workflow, target `c_crosswalk_examples`, only created if the siteSR 
+    # workflow was run with `run_GEE: TRUE`)
+    tar_file_read(
+      name = c_crosswalk_examples_Drive_id,
+      command = file.path(config_siteSR_directory, 
+                          "c_siteSR_stack/out/crosswalk_examples_drive_id.csv"),
+      read = read_csv(!!.x),
+      cue = tar_cue("always")
+    ),
+    
+    tar_target(
+      name = c_crosswalk_examples,
+      command = {
+        most_recent <- c_crosswalk_examples_Drive_id %>% 
+          arrange(desc(name)) %>% 
+          slice(1)
+        retrieve_target(target = "c_crosswalk_examples",
+                        id_df = most_recent, 
+                        local_folder = "y_siteSR_targets/out/", 
+                        google_email = lakeSR_config$google_email,
+                        version_date = str_sub(most_recent$name, -14 , -5),
+                        file_type = ".rds")
+      },
+      packages = c("tidyverse", "googledrive"),
+      cue = tar_cue("always")
     )
     
   )
